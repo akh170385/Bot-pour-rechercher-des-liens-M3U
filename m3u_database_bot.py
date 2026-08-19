@@ -4,14 +4,20 @@ import telebot
 import json
 import time
 import threading
+import logging
 from datetime import datetime
 from typing import List, Dict, Set
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
 # ============================================
+# LOGS POUR VOIR CE QUI SE PASSE
+# ============================================
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+# ============================================
 # SERVEUR HTTP FACTICE POUR RENDER
 # ============================================
-
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -20,18 +26,16 @@ class HealthHandler(BaseHTTPRequestHandler):
         self.wfile.write(b'Bot is running!')
 
 def run_health_server():
-    """Lance un petit serveur HTTP sur le port 8080 pour Render"""
     try:
         server = HTTPServer(('0.0.0.0', 8080), HealthHandler)
-        print("✅ Serveur HTTP sur le port 8080 (pour Render)")
+        logger.info("✅ Serveur HTTP sur le port 8080 (pour Render)")
         server.serve_forever()
     except Exception as e:
-        print(f"⚠️ Erreur serveur HTTP: {e}")
+        logger.warning(f"⚠️ Erreur serveur HTTP: {e}")
 
 # ============================================
 # CONFIGURATION
 # ============================================
-
 BOT_TOKEN = os.environ.get('BOT_TOKEN')
 ADMIN_IDS = list(map(int, os.environ.get('ADMIN_IDS', '123456789').split(',')))
 
@@ -41,28 +45,45 @@ INDEX_FILE = "m3u_index.json"
 
 class M3UDatabaseBot:
     def __init__(self, token: str):
-        self.bot = telebot.TeleBot(token)
-        self.index = self.load_index()
+        self.token = token
+        self.bot = None
+        self.index = {}
+        self.running = True
+        self.connect_bot()
+        self.load_index()
         self.setup_handlers()
-        print("✅ Bot M3U Database démarré !")
-        print(f"📊 Fichiers chargés : {len(self.index)}")
-    
-    def load_index(self) -> Dict:
+        logger.info("✅ Bot M3U Database démarré !")
+        logger.info(f"📊 Fichiers chargés : {len(self.index)}")
+
+    def connect_bot(self):
+        try:
+            self.bot = telebot.TeleBot(self.token)
+            logger.info("✅ Bot connecté à Telegram")
+            return True
+        except Exception as e:
+            logger.error(f"❌ Erreur de connexion: {e}")
+            return False
+
+    def load_index(self):
         if os.path.exists(INDEX_FILE):
             try:
                 with open(INDEX_FILE, 'r', encoding='utf-8') as f:
-                    return json.load(f)
-            except:
-                pass
-        return {}
-    
+                    self.index = json.load(f)
+                logger.info(f"📂 Index chargé: {len(self.index)} fichiers")
+                return
+            except Exception as e:
+                logger.warning(f"⚠️ Erreur chargement index: {e}")
+        self.index = {}
+        logger.info("📁 Index vide, démarrage propre")
+
     def save_index(self):
         try:
             with open(INDEX_FILE, 'w', encoding='utf-8') as f:
                 json.dump(self.index, f, indent=2, ensure_ascii=False)
+            logger.info("💾 Index sauvegardé")
         except Exception as e:
-            print(f"❌ Erreur: {e}")
-    
+            logger.error(f"❌ Erreur sauvegarde: {e}")
+
     def get_all_links(self) -> Set[str]:
         all_links = set()
         for filename in self.index.keys():
@@ -77,64 +98,87 @@ class M3UDatabaseBot:
                 except:
                     pass
         return all_links
-    
+
     def search_links_by_server(self, server_url: str) -> List[str]:
-        found_links = []
+        """Recherche les lignes complètes contenant le serveur"""
+        found_lines = []
         server_clean = server_url.replace("http://", "").replace("https://", "").strip()
         server_clean = server_clean.rstrip('/')
-        all_links = self.get_all_links()
-        for link in all_links:
-            if server_clean in link or server_url in link:
-                found_links.append(link)
-        return found_links
-    
+        
+        for filename in self.index.keys():
+            filepath = os.path.join(DATA_FOLDER, filename)
+            if os.path.exists(filepath):
+                try:
+                    with open(filepath, 'r', encoding='utf-8') as f:
+                        content = f.read()
+                        # On cherche le bloc complet qui contient le serveur
+                        blocks = re.split(r'━━━━━━━━━━━━━━━━━━', content)
+                        for block in blocks:
+                            if server_clean in block or server_url in block:
+                                found_lines.append(block.strip())
+                except:
+                    pass
+        
+        return found_lines
+
     def is_admin(self, user_id: int) -> bool:
         return user_id in ADMIN_IDS
-    
+
     def setup_handlers(self):
         @self.bot.message_handler(commands=['start'])
         def start_handler(message):
             self.start_command(message)
-        
+
         @self.bot.message_handler(commands=['help'])
         def help_handler(message):
             self.help_command(message)
-        
+
         @self.bot.message_handler(commands=['m3u', 'search'])
         def m3u_handler(message):
             self.m3u_command(message)
-        
+
         @self.bot.message_handler(commands=['stats'])
         def stats_handler(message):
             self.stats_command(message)
-        
+
+        @self.bot.message_handler(commands=['save'])
+        def save_handler(message):
+            self.save_command(message)
+
         @self.bot.message_handler(content_types=['document'])
         def document_handler(message):
             self.handle_document(message)
-        
+
         @self.bot.callback_query_handler(func=lambda call: True)
         def callback_handler(call):
             self.handle_callback(call)
-    
+
     def start_command(self, message):
         welcome_text = """
-🤖 **Bot M3U Database**
+🤖 **Bot M3U Database - Version Améliorée**
 
 📋 **Commandes :**
 🔍 `/m3u <serveur>` - Recherche des liens M3U
 📊 `/stats` - Statistiques
+💾 `/save` - Sauvegarde manuelle des données
 📤 Envoyer un fichier .txt - Ajouter des liens (admin)
+
+✅ **Nouveautés :**
+- Affichage complet des informations (Portail, User, Pass, Expiration)
+- Recherche par serveur
+- Résultats détaillés
 """
         self.bot.reply_to(message, welcome_text, parse_mode='Markdown')
-    
+
     def help_command(self, message):
         help_text = """
 🤖 **Aide**
 🔍 `/m3u http://serveur.com:8080`
 📊 `/stats`
+💾 `/save`
 """
         self.bot.reply_to(message, help_text, parse_mode='Markdown')
-    
+
     def m3u_command(self, message):
         text = message.text
         if not text or len(text.split()) < 2:
@@ -144,9 +188,9 @@ class M3UDatabaseBot:
                 parse_mode='Markdown'
             )
             return
-        
+
         server_url = text.split(' ', 1)[1].strip()
-        
+
         if not server_url.startswith('http://') and not server_url.startswith('https://'):
             self.bot.reply_to(
                 message,
@@ -154,94 +198,89 @@ class M3UDatabaseBot:
                 parse_mode='Markdown'
             )
             return
-        
+
         search_msg = self.bot.reply_to(
             message,
             f"🔍 Recherche pour : `{server_url}`...",
             parse_mode='Markdown'
         )
-        
-        links = self.search_links_by_server(server_url)
-        
-        if links:
-            result_text = f"✅ **{len(links)} liens trouvés**\n\n"
+
+        blocks = self.search_links_by_server(server_url)
+
+        if blocks:
+            result_text = f"✅ **{len(blocks)} serveurs trouvés**\n\n"
             
-            if len(links) <= 30:
-                for i, link in enumerate(links, 1):
-                    result_text += f"{i}. `{link}`\n"
-                
-                self.bot.edit_message_text(
-                    result_text,
-                    search_msg.chat.id,
-                    search_msg.message_id,
-                    parse_mode='Markdown'
-                )
-            else:
-                filename = f"m3u_{int(time.time())}.txt"
-                with open(filename, 'w', encoding='utf-8') as f:
-                    for link in links:
-                        f.write(f"{link}\n")
-                
-                result_text += f"📁 {len(links)} liens trouvés"
-                
-                with open(filename, 'rb') as f:
-                    self.bot.send_document(
-                        message.chat.id,
-                        f,
-                        caption=result_text,
-                        parse_mode='Markdown'
-                    )
-                
-                os.remove(filename)
-                self.bot.delete_message(search_msg.chat.id, search_msg.message_id)
-        else:
+            for i, block in enumerate(blocks, 1):
+                result_text += f"**[{i}]**\n"
+                result_text += f"{block}\n\n"
+            
+            # Limite à 10 pour éviter les messages trop longs
+            if len(blocks) > 10:
+                result_text += f"\n... et {len(blocks) - 10} autres résultats"
+
             self.bot.edit_message_text(
-                f"❌ Aucun lien trouvé pour : `{server_url}`",
+                result_text,
                 search_msg.chat.id,
                 search_msg.message_id,
                 parse_mode='Markdown'
             )
-    
+        else:
+            self.bot.edit_message_text(
+                f"❌ Aucun serveur trouvé pour : `{server_url}`",
+                search_msg.chat.id,
+                search_msg.message_id,
+                parse_mode='Markdown'
+            )
+
     def stats_command(self, message):
         total_files = len(self.index)
         total_links = len(self.get_all_links())
-        
+
         stats_text = f"""
 📊 **Statistiques**
 📁 Fichiers : {total_files}
 🔗 Liens : {total_links}
+🔄 Statut : ✅ en ligne
 """
         self.bot.reply_to(message, stats_text, parse_mode='Markdown')
-    
+
+    def save_command(self, message):
+        if not self.is_admin(message.from_user.id):
+            self.bot.reply_to(message, "❌ Permission refusée.")
+            return
+
+        self.save_index()
+        self.bot.reply_to(message, "✅ Sauvegarde manuelle effectuée !")
+
     def handle_document(self, message):
         if not self.is_admin(message.from_user.id):
             self.bot.reply_to(message, "❌ Permission refusée.")
             return
-        
+
         document = message.document
-        
+
         if not document.file_name.endswith('.txt'):
             self.bot.reply_to(message, "❌ Seuls les fichiers .txt sont acceptés.")
             return
-        
+
         try:
             file_info = self.bot.get_file(document.file_id)
             downloaded_file = self.bot.download_file(file_info.file_path)
-            
+
             timestamp = int(time.time())
             filename = f"{timestamp}_{document.file_name}"
             filepath = os.path.join(DATA_FOLDER, filename)
-            
+
             with open(filepath, 'wb') as f:
                 f.write(downloaded_file)
-            
+
             link_count = 0
             with open(filepath, 'r', encoding='utf-8') as f:
                 for line in f:
                     line = line.strip()
                     if line and not line.startswith('#'):
                         link_count += 1
-            
+
             self.index[filename] = {
                 'original_name': document.file_name,
                 'date_added': datetime.now().isoformat(),
@@ -249,28 +288,31 @@ class M3UDatabaseBot:
                 'size': document.file_size
             }
             self.save_index()
-            
+
             self.bot.reply_to(
                 message,
                 f"✅ Fichier ajouté !\n📁 {document.file_name}\n🔗 {link_count} liens",
                 parse_mode='Markdown'
             )
-            
+
         except Exception as e:
+            logger.error(f"❌ Erreur traitement fichier: {e}")
             self.bot.reply_to(message, f"❌ Erreur : {str(e)}")
-    
+
     def handle_callback(self, call):
         self.bot.answer_callback_query(call.id)
-    
-    def run(self):
-        print("🚀 Bot démarré !")
-        try:
-            self.bot.polling(none_stop=True, interval=1)
-        except Exception as e:
-            print(f"❌ Erreur: {e}")
-            time.sleep(5)
-            self.run()
 
+    def run(self):
+        logger.info("🚀 Bot démarré !")
+        while self.running:
+            try:
+                self.bot.polling(none_stop=True, interval=1, timeout=60)
+            except Exception as e:
+                logger.error(f"❌ Erreur polling: {e}")
+                logger.info("🔄 Reconnexion dans 10 secondes...")
+                time.sleep(10)
+                self.connect_bot()
+                self.setup_handlers()
 
 # ============================================
 # DÉMARRAGE
@@ -278,13 +320,11 @@ class M3UDatabaseBot:
 
 if __name__ == '__main__':
     if not BOT_TOKEN:
-        print("❌ Erreur: BOT_TOKEN non défini")
+        logger.error("❌ Erreur: BOT_TOKEN non défini")
         exit(1)
-    
-    # 1. Lancer le serveur HTTP pour Render
+
     thread = threading.Thread(target=run_health_server, daemon=True)
     thread.start()
-    
-    # 2. Lancer le bot
+
     bot = M3UDatabaseBot(BOT_TOKEN)
     bot.run()
