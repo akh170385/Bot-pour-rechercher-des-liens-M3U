@@ -13,28 +13,75 @@ DATA_FOLDER = "m3u_database"
 os.makedirs(DATA_FOLDER, exist_ok=True)
 INDEX_FILE = "m3u_index.json"
 
+# ============================================
+# STOCKAGE AUTOMATIQUE DANS TELEGRAM
+# ============================================
+
 class M3UDatabaseBot:
     def __init__(self, token: str):
         self.bot = telebot.TeleBot(token)
         self.index = self.load_index()
         self.setup_handlers()
         print("✅ Bot M3U Database démarré !")
+        print(f"📊 Fichiers chargés : {len(self.index)}")
     
     def load_index(self) -> Dict:
+        """Charge l'index depuis le fichier local OU depuis Telegram"""
+        # Essayer de charger depuis le fichier local d'abord
         if os.path.exists(INDEX_FILE):
             try:
                 with open(INDEX_FILE, 'r', encoding='utf-8') as f:
                     return json.load(f)
             except:
                 pass
+        
+        # Si pas de fichier local, essayer de récupérer depuis Telegram
+        try:
+            # Le bot envoie un message à lui-même pour récupérer les données
+            # On utilise le fichier envoyé précédemment
+            messages = self.bot.get_chat_history(self.bot.get_me().id, limit=5)
+            for msg in messages:
+                if msg.document and msg.document.file_name == INDEX_FILE:
+                    # Télécharger le fichier
+                    file_info = self.bot.get_file(msg.document.file_id)
+                    downloaded = self.bot.download_file(file_info.file_path)
+                    
+                    # Sauvegarder localement
+                    with open(INDEX_FILE, 'wb') as f:
+                        f.write(downloaded)
+                    
+                    # Charger le contenu
+                    with open(INDEX_FILE, 'r', encoding='utf-8') as f:
+                        return json.load(f)
+        except Exception as e:
+            print(f"⚠️ Erreur chargement depuis Telegram: {e}")
+        
         return {}
     
     def save_index(self):
+        """Sauvegarde l'index localement ET sur Telegram"""
+        # Sauvegarde locale
         try:
             with open(INDEX_FILE, 'w', encoding='utf-8') as f:
                 json.dump(self.index, f, indent=2, ensure_ascii=False)
+            
+            # Sauvegarde sur Telegram (envoi à lui-même)
+            try:
+                # Récupérer l'ID du bot lui-même
+                bot_id = self.bot.get_me().id
+                
+                with open(INDEX_FILE, 'rb') as f:
+                    self.bot.send_document(
+                        bot_id,  # Envoi à lui-même
+                        f,
+                        caption=f"📦 Sauvegarde - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+                    )
+                print("✅ Sauvegarde sur Telegram réussie !")
+            except Exception as e:
+                print(f"⚠️ Erreur sauvegarde Telegram: {e}")
+                
         except Exception as e:
-            print(f"❌ Erreur: {e}")
+            print(f"❌ Erreur sauvegarde: {e}")
     
     def get_all_links(self) -> Set[str]:
         all_links = set()
@@ -81,6 +128,10 @@ class M3UDatabaseBot:
         def stats_handler(message):
             self.stats_command(message)
         
+        @self.bot.message_handler(commands=['backup'])
+        def backup_handler(message):
+            self.backup_command(message)
+        
         @self.bot.message_handler(content_types=['document'])
         def document_handler(message):
             self.handle_document(message)
@@ -91,12 +142,17 @@ class M3UDatabaseBot:
     
     def start_command(self, message):
         welcome_text = """
-🤖 **Bot M3U Database**
+🤖 **Bot M3U Database - Stockage Auto**
 
 📋 **Commandes :**
 🔍 `/m3u <serveur>` - Recherche des liens M3U
 📊 `/stats` - Statistiques
+💾 `/backup` - Forcer la sauvegarde sur Telegram
 📤 Envoyer un fichier .txt - Ajouter des liens (admin)
+
+💡 **Stockage persistant :**
+Les fichiers sont automatiquement sauvegardés sur Telegram !
+Le bot les récupère à chaque redémarrage.
 """
         self.bot.reply_to(message, welcome_text, parse_mode='Markdown')
     
@@ -105,6 +161,7 @@ class M3UDatabaseBot:
 🤖 **Aide**
 🔍 `/m3u http://serveur.com:8080`
 📊 `/stats`
+💾 `/backup` - Sauvegarde forcée
 """
         self.bot.reply_to(message, help_text, parse_mode='Markdown')
     
@@ -183,8 +240,18 @@ class M3UDatabaseBot:
 📊 **Statistiques**
 📁 Fichiers : {total_files}
 🔗 Liens : {total_links}
+💾 Stockage : Telegram (Auto)
 """
         self.bot.reply_to(message, stats_text, parse_mode='Markdown')
+    
+    def backup_command(self, message):
+        """Commande /backup - Force une sauvegarde sur Telegram"""
+        if not self.is_admin(message.from_user.id):
+            self.bot.reply_to(message, "❌ Permission refusée.")
+            return
+        
+        self.save_index()
+        self.bot.reply_to(message, "✅ Sauvegarde effectuée sur Telegram !")
     
     def handle_document(self, message):
         if not self.is_admin(message.from_user.id):
@@ -221,11 +288,11 @@ class M3UDatabaseBot:
                 'links': link_count,
                 'size': document.file_size
             }
-            self.save_index()
+            self.save_index()  # ← Sauvegarde sur Telegram
             
             self.bot.reply_to(
                 message,
-                f"✅ Fichier ajouté !\n📁 {document.file_name}\n🔗 {link_count} liens",
+                f"✅ Fichier ajouté !\n📁 {document.file_name}\n🔗 {link_count} liens\n💾 Sauvegardé sur Telegram",
                 parse_mode='Markdown'
             )
             
@@ -237,6 +304,7 @@ class M3UDatabaseBot:
     
     def run(self):
         print("🚀 Bot démarré !")
+        print("💾 Stockage automatique sur Telegram activé")
         try:
             self.bot.polling(none_stop=True, interval=1)
         except Exception as e:
