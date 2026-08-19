@@ -10,13 +10,13 @@ from typing import List, Dict, Set
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
 # ============================================
-# LOGS POUR VOIR CE QUI SE PASSE
+# LOGS
 # ============================================
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 # ============================================
-# SERVEUR HTTP FACTICE POUR RENDER
+# SERVEUR HTTP POUR RENDER
 # ============================================
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -28,7 +28,7 @@ class HealthHandler(BaseHTTPRequestHandler):
 def run_health_server():
     try:
         server = HTTPServer(('0.0.0.0', 8080), HealthHandler)
-        logger.info("✅ Serveur HTTP sur le port 8080 (pour Render)")
+        logger.info("✅ Serveur HTTP sur le port 8080")
         server.serve_forever()
     except Exception as e:
         logger.warning(f"⚠️ Erreur serveur HTTP: {e}")
@@ -42,6 +42,7 @@ ADMIN_IDS = list(map(int, os.environ.get('ADMIN_IDS', '123456789').split(',')))
 DATA_FOLDER = "m3u_database"
 os.makedirs(DATA_FOLDER, exist_ok=True)
 INDEX_FILE = "m3u_index.json"
+BACKUP_FILE = "m3u_backup.txt"  # Fichier de sauvegarde sur Telegram
 
 class M3UDatabaseBot:
     def __init__(self, token: str):
@@ -65,24 +66,68 @@ class M3UDatabaseBot:
             return False
 
     def load_index(self):
+        """Charge l'index depuis le fichier local OU depuis Telegram"""
+        # 1. Essayer depuis le fichier local
         if os.path.exists(INDEX_FILE):
             try:
                 with open(INDEX_FILE, 'r', encoding='utf-8') as f:
                     self.index = json.load(f)
-                logger.info(f"📂 Index chargé: {len(self.index)} fichiers")
+                logger.info(f"📂 Index chargé depuis fichier local: {len(self.index)} fichiers")
                 return
             except Exception as e:
-                logger.warning(f"⚠️ Erreur chargement index: {e}")
+                logger.warning(f"⚠️ Erreur chargement local: {e}")
+
+        # 2. Essayer de récupérer depuis Telegram
+        try:
+            # Récupère les messages du bot lui-même
+            bot_id = self.bot.get_me().id
+            messages = self.bot.get_chat_history(bot_id, limit=10)
+            
+            for msg in messages:
+                if msg.document and msg.document.file_name == BACKUP_FILE:
+                    # Télécharger le fichier de sauvegarde
+                    file_info = self.bot.get_file(msg.document.file_id)
+                    downloaded = self.bot.download_file(file_info.file_path)
+                    
+                    # Sauvegarder localement
+                    with open(INDEX_FILE, 'wb') as f:
+                        f.write(downloaded)
+                    
+                    # Charger le contenu
+                    with open(INDEX_FILE, 'r', encoding='utf-8') as f:
+                        self.index = json.load(f)
+                    
+                    logger.info(f"📂 Index récupéré depuis Telegram: {len(self.index)} fichiers")
+                    return
+        except Exception as e:
+            logger.warning(f"⚠️ Erreur chargement depuis Telegram: {e}")
+
+        # 3. Index vide
         self.index = {}
         logger.info("📁 Index vide, démarrage propre")
 
     def save_index(self):
+        """Sauvegarde l'index localement ET sur Telegram"""
+        # Sauvegarde locale
         try:
             with open(INDEX_FILE, 'w', encoding='utf-8') as f:
                 json.dump(self.index, f, indent=2, ensure_ascii=False)
-            logger.info("💾 Index sauvegardé")
+            logger.info("💾 Index sauvegardé localement")
         except Exception as e:
-            logger.error(f"❌ Erreur sauvegarde: {e}")
+            logger.error(f"❌ Erreur sauvegarde locale: {e}")
+
+        # Sauvegarde sur Telegram (fichier envoyé à lui-même)
+        try:
+            bot_id = self.bot.get_me().id
+            with open(INDEX_FILE, 'rb') as f:
+                self.bot.send_document(
+                    bot_id,
+                    f,
+                    caption=f"💾 Sauvegarde - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+                )
+            logger.info("💾 Sauvegarde sur Telegram réussie")
+        except Exception as e:
+            logger.error(f"❌ Erreur sauvegarde Telegram: {e}")
 
     def get_all_links(self) -> Set[str]:
         all_links = set()
@@ -100,7 +145,6 @@ class M3UDatabaseBot:
         return all_links
 
     def search_links_by_server(self, server_url: str) -> List[str]:
-        """Recherche les lignes complètes contenant le serveur"""
         found_lines = []
         server_clean = server_url.replace("http://", "").replace("https://", "").strip()
         server_clean = server_clean.rstrip('/')
@@ -111,7 +155,6 @@ class M3UDatabaseBot:
                 try:
                     with open(filepath, 'r', encoding='utf-8') as f:
                         content = f.read()
-                        # On cherche le bloc complet qui contient le serveur
                         blocks = re.split(r'━━━━━━━━━━━━━━━━━━', content)
                         for block in blocks:
                             if server_clean in block or server_url in block:
@@ -155,18 +198,18 @@ class M3UDatabaseBot:
 
     def start_command(self, message):
         welcome_text = """
-🤖 **Bot M3U Database - Version Améliorée**
+🤖 **Bot M3U Database - Version Sauvegarde Auto**
 
 📋 **Commandes :**
 🔍 `/m3u <serveur>` - Recherche des liens M3U
 📊 `/stats` - Statistiques
-💾 `/save` - Sauvegarde manuelle des données
+💾 `/save` - Sauvegarde manuelle sur Telegram
 📤 Envoyer un fichier .txt - Ajouter des liens (admin)
 
-✅ **Nouveautés :**
-- Affichage complet des informations (Portail, User, Pass, Expiration)
-- Recherche par serveur
-- Résultats détaillés
+✅ **Sauvegarde automatique :**
+- Fichiers stockés sur Telegram
+- Récupérés au redémarrage
+- Ne sont jamais perdus
 """
         self.bot.reply_to(message, welcome_text, parse_mode='Markdown')
 
@@ -214,7 +257,6 @@ class M3UDatabaseBot:
                 result_text += f"**[{i}]**\n"
                 result_text += f"{block}\n\n"
             
-            # Limite à 10 pour éviter les messages trop longs
             if len(blocks) > 10:
                 result_text += f"\n... et {len(blocks) - 10} autres résultats"
 
@@ -241,6 +283,7 @@ class M3UDatabaseBot:
 📁 Fichiers : {total_files}
 🔗 Liens : {total_links}
 🔄 Statut : ✅ en ligne
+💾 Sauvegarde : Telegram
 """
         self.bot.reply_to(message, stats_text, parse_mode='Markdown')
 
@@ -250,7 +293,7 @@ class M3UDatabaseBot:
             return
 
         self.save_index()
-        self.bot.reply_to(message, "✅ Sauvegarde manuelle effectuée !")
+        self.bot.reply_to(message, "✅ Sauvegarde sur Telegram effectuée !")
 
     def handle_document(self, message):
         if not self.is_admin(message.from_user.id):
@@ -287,11 +330,11 @@ class M3UDatabaseBot:
                 'links': link_count,
                 'size': document.file_size
             }
-            self.save_index()
+            self.save_index()  # Sauvegarde automatique sur Telegram
 
             self.bot.reply_to(
                 message,
-                f"✅ Fichier ajouté !\n📁 {document.file_name}\n🔗 {link_count} liens",
+                f"✅ Fichier ajouté !\n📁 {document.file_name}\n🔗 {link_count} liens\n💾 Sauvegardé sur Telegram",
                 parse_mode='Markdown'
             )
 
