@@ -29,12 +29,14 @@ logger = logging.getLogger(__name__)
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 
 if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN n'est pas défini dans les variables Render.")
+    raise RuntimeError(
+        "BOT_TOKEN n'est pas défini dans les variables Render."
+    )
 
-# ADMIN_IDS doit être par exemple :
-# 123456789
-# ou :
-# 123456789,987654321
+
+# ============================================================
+# ADMIN IDS
+# ============================================================
 
 try:
     ADMIN_IDS = [
@@ -45,15 +47,15 @@ try:
 except ValueError:
     ADMIN_IDS = []
 
+
 if not ADMIN_IDS:
     logger.warning(
-        "⚠️ ADMIN_IDS n'est pas configuré correctement. "
-        "Les fonctions administrateur seront refusées."
+        "⚠️ ADMIN_IDS n'est pas configuré."
     )
 
 
 # ============================================================
-# STOCKAGE LOCAL PROVISOIRE
+# STOCKAGE
 # ============================================================
 
 DATA_FOLDER = "m3u_database"
@@ -70,12 +72,13 @@ app = Flask(__name__)
 
 
 # ============================================================
-# BOT
+# TELEGRAM BOT
 # ============================================================
 
 bot = telebot.TeleBot(
     BOT_TOKEN,
-    parse_mode=None
+    parse_mode=None,
+    threaded=False
 )
 
 
@@ -87,20 +90,25 @@ index = {}
 
 
 def load_index():
-    """
-    Charge l'index JSON local.
-    Pour l'instant, aucun stockage externe n'est utilisé.
-    """
-
     global index
 
     if not os.path.exists(INDEX_FILE):
         index = {}
-        logger.info("📁 Aucun index local trouvé. Index vide.")
+
+        logger.info(
+            "📁 Aucun index local trouvé. Index vide."
+        )
+
         return
 
     try:
-        with open(INDEX_FILE, "r", encoding="utf-8") as f:
+
+        with open(
+            INDEX_FILE,
+            "r",
+            encoding="utf-8"
+        ) as f:
+
             index = json.load(f)
 
         logger.info(
@@ -108,22 +116,24 @@ def load_index():
         )
 
     except Exception as e:
-        logger.error(
+
+        logger.exception(
             f"❌ Impossible de charger {INDEX_FILE}: {e}"
         )
+
         index = {}
 
 
 def save_index():
-    """
-    Sauvegarde provisoire uniquement dans le fichier JSON local.
-
-    Plus tard, nous pourrons remplacer cette fonction par Supabase
-    sans toucher au système Telegram/Webhook.
-    """
 
     try:
-        with open(INDEX_FILE, "w", encoding="utf-8") as f:
+
+        with open(
+            INDEX_FILE,
+            "w",
+            encoding="utf-8"
+        ) as f:
+
             json.dump(
                 index,
                 f,
@@ -131,10 +141,13 @@ def save_index():
                 ensure_ascii=False
             )
 
-        logger.info("💾 Index sauvegardé localement.")
+        logger.info(
+            "💾 Index sauvegardé localement."
+        )
 
     except Exception as e:
-        logger.error(
+
+        logger.exception(
             f"❌ Erreur sauvegarde index : {e}"
         )
 
@@ -144,15 +157,15 @@ def save_index():
 # ============================================================
 
 def get_all_links() -> Set[str]:
-    """
-    Retourne tous les liens trouvés dans les fichiers M3U/TXT.
-    """
 
     all_links = set()
 
     for filename in index.keys():
 
-        filepath = os.path.join(DATA_FOLDER, filename)
+        filepath = os.path.join(
+            DATA_FOLDER,
+            filename
+        )
 
         if not os.path.exists(filepath):
             continue
@@ -170,7 +183,10 @@ def get_all_links() -> Set[str]:
 
                     line = line.strip()
 
-                    if line and not line.startswith("#"):
+                    if (
+                        line
+                        and not line.startswith("#")
+                    ):
                         all_links.add(line)
 
         except Exception as e:
@@ -182,24 +198,42 @@ def get_all_links() -> Set[str]:
     return all_links
 
 
-def search_links_by_server(server_url: str) -> List[str]:
-    """
-    Recherche un serveur dans tous les fichiers enregistrés.
-    """
+def normalize_server(server_url: str) -> str:
+
+    server = server_url.strip()
+
+    server = re.sub(
+        r"^https?://",
+        "",
+        server,
+        flags=re.IGNORECASE
+    )
+
+    server = server.rstrip("/")
+
+    return server.lower()
+
+
+def search_links_by_server(
+    server_url: str
+) -> List[str]:
 
     found_lines = []
 
-    server_clean = (
+    server_clean = normalize_server(
         server_url
-        .replace("http://", "")
-        .replace("https://", "")
-        .strip()
-        .rstrip("/")
+    )
+
+    logger.info(
+        f"🔎 Recherche serveur : {server_clean}"
     )
 
     for filename in index.keys():
 
-        filepath = os.path.join(DATA_FOLDER, filename)
+        filepath = os.path.join(
+            DATA_FOLDER,
+            filename
+        )
 
         if not os.path.exists(filepath):
             continue
@@ -222,159 +256,216 @@ def search_links_by_server(server_url: str) -> List[str]:
 
             for block in blocks:
 
-                if (
-                    server_clean in block
-                    or server_url in block
-                ):
-                    cleaned = block.strip()
+                block_clean = block.strip()
 
-                    if cleaned:
-                        found_lines.append(cleaned)
+                if not block_clean:
+                    continue
+
+                block_normalized = normalize_server(
+                    block_clean
+                )
+
+                if (
+                    server_clean in block_normalized
+                    or server_clean in block_clean.lower()
+                ):
+
+                    found_lines.append(
+                        block_clean
+                    )
 
         except Exception as e:
 
             logger.warning(
-                f"⚠️ Erreur recherche dans {filename}: {e}"
+                f"⚠️ Erreur recherche dans "
+                f"{filename}: {e}"
             )
 
     return found_lines
 
 
 def is_admin(user_id: int) -> bool:
+
     return user_id in ADMIN_IDS
 
 
 # ============================================================
-# COMMAND /START
+# /START
 # ============================================================
 
 @bot.message_handler(commands=["start"])
 def start_handler(message):
 
+    logger.info(
+        f"📩 /start reçu de "
+        f"user_id={message.from_user.id}"
+    )
+
     welcome_text = """
-🤖 *Bot M3U Database*
+🤖 Bot M3U Database
 
-📋 *Commandes :*
+📋 Commandes :
 
-🔍 `/m3u <serveur>` - Recherche des liens M3U
+🔍 /m3u <serveur>
+Recherche des liens M3U.
 
-📊 `/stats` - Statistiques
+📊 /stats
+Affiche les statistiques.
 
-💾 `/save` - Sauvegarde manuelle
+💾 /save
+Sauvegarde manuelle (admin).
 
-📤 Envoyer un fichier `.txt` - Ajouter des liens *(admin)*
+📤 Envoyer un fichier .txt
+Ajoute des liens (admin).
 
-✅ Le bot fonctionne maintenant avec Telegram Webhook.
+✅ Bot connecté via Telegram Webhook.
 """
 
     try:
 
         bot.reply_to(
             message,
-            welcome_text,
-            parse_mode="Markdown"
+            welcome_text
+        )
+
+        logger.info(
+            "✅ Réponse /start envoyée."
         )
 
     except Exception as e:
 
-        logger.error(
-            f"❌ Erreur /start : {e}"
+        logger.exception(
+            f"❌ Erreur réponse /start : {e}"
         )
 
 
 # ============================================================
-# COMMAND /HELP
+# /HELP
 # ============================================================
 
 @bot.message_handler(commands=["help"])
 def help_handler(message):
 
+    logger.info(
+        f"📩 /help reçu de "
+        f"user_id={message.from_user.id}"
+    )
+
     help_text = """
-🤖 *Aide*
+🤖 Aide
 
-🔍 `/m3u http://serveur.com:8080`
+🔍 /m3u http://serveur.com:8080
 
-📊 `/stats`
+📊 /stats
 
-💾 `/save`
+💾 /save
 
-📤 Administrateur : envoyer un fichier `.txt`
+📤 Administrateur :
+envoyer un fichier .txt
 """
 
     try:
 
         bot.reply_to(
             message,
-            help_text,
-            parse_mode="Markdown"
+            help_text
+        )
+
+        logger.info(
+            "✅ Réponse /help envoyée."
         )
 
     except Exception as e:
 
-        logger.error(
-            f"❌ Erreur /help : {e}"
+        logger.exception(
+            f"❌ Erreur réponse /help : {e}"
         )
 
 
 # ============================================================
-# COMMAND /M3U ET /SEARCH
+# /M3U /SEARCH
 # ============================================================
 
-@bot.message_handler(commands=["m3u", "search"])
+@bot.message_handler(
+    commands=["m3u", "search"]
+)
 def m3u_handler(message):
+
+    logger.info(
+        f"📩 Commande recherche reçue : "
+        f"{message.text}"
+    )
 
     try:
 
-        text = message.text
+        text = message.text or ""
 
-        if not text or len(text.split()) < 2:
+        parts = text.split(
+            " ",
+            1
+        )
+
+        if len(parts) < 2:
 
             bot.reply_to(
                 message,
-                "❌ Format : `/m3u <serveur>`\n"
-                "Exemple : `/m3u http://serveur.com:8080`",
-                parse_mode="Markdown"
+                "❌ Format incorrect.\n\n"
+                "Utilise :\n"
+                "/m3u http://serveur.com:8080"
             )
 
             return
 
-        server_url = text.split(" ", 1)[1].strip()
+        server_url = parts[1].strip()
 
         if not (
-            server_url.startswith("http://")
-            or server_url.startswith("https://")
+            server_url.startswith(
+                "http://"
+            )
+            or server_url.startswith(
+                "https://"
+            )
         ):
 
             bot.reply_to(
                 message,
                 "❌ URL invalide.\n\n"
-                "Exemple : `http://serveur.com:8080`",
-                parse_mode="Markdown"
+                "Exemple :\n"
+                "http://serveur.com:8080"
             )
 
             return
 
         search_msg = bot.reply_to(
             message,
-            f"🔍 Recherche pour : `{server_url}`...",
-            parse_mode="Markdown"
+            f"🔍 Recherche pour :\n{server_url}"
         )
 
-        blocks = search_links_by_server(server_url)
+        logger.info(
+            f"🔎 Recherche lancée : {server_url}"
+        )
+
+        blocks = search_links_by_server(
+            server_url
+        )
+
+        logger.info(
+            f"🔎 Résultats trouvés : {len(blocks)}"
+        )
 
         if blocks:
 
-            # On limite l'affichage pour éviter de dépasser
-            # les limites de longueur des messages Telegram.
-
             result_text = (
-                f"✅ *{len(blocks)} résultat(s) trouvé(s)*\n\n"
+                f"✅ {len(blocks)} résultat(s) trouvé(s)\n\n"
             )
 
-            for i, block in enumerate(blocks[:10], 1):
+            for i, block in enumerate(
+                blocks[:10],
+                1
+            ):
 
                 result_text += (
-                    f"*[{i}]*\n"
+                    f"[{i}]\n"
                     f"{block}\n\n"
                 )
 
@@ -388,20 +479,36 @@ def m3u_handler(message):
         else:
 
             result_text = (
-                f"❌ Aucun serveur trouvé pour : "
-                f"`{server_url}`"
+                "❌ Aucun résultat trouvé pour :\n"
+                f"{server_url}"
             )
 
-        # Telegram limite les messages à environ 4096 caractères.
         if len(result_text) > 4000:
-            result_text = result_text[:3950] + "\n\n..."
 
-        bot.edit_message_text(
-            result_text,
-            search_msg.chat.id,
-            search_msg.message_id,
-            parse_mode="Markdown"
-        )
+            result_text = (
+                result_text[:3950]
+                + "\n\n..."
+            )
+
+        try:
+
+            bot.edit_message_text(
+                result_text,
+                search_msg.chat.id,
+                search_msg.message_id
+            )
+
+        except Exception as e:
+
+            logger.warning(
+                f"⚠️ Impossible de modifier "
+                f"le message de recherche : {e}"
+            )
+
+            bot.reply_to(
+                message,
+                result_text
+            )
 
     except Exception as e:
 
@@ -413,7 +520,8 @@ def m3u_handler(message):
 
             bot.reply_to(
                 message,
-                f"❌ Erreur pendant la recherche : {e}"
+                "❌ Une erreur est survenue "
+                "pendant la recherche."
             )
 
         except Exception:
@@ -421,52 +529,62 @@ def m3u_handler(message):
 
 
 # ============================================================
-# COMMAND /STATS
+# /STATS
 # ============================================================
 
 @bot.message_handler(commands=["stats"])
 def stats_handler(message):
 
+    logger.info(
+        f"📩 /stats reçu de "
+        f"user_id={message.from_user.id}"
+    )
+
     try:
 
         total_files = len(index)
-        total_links = len(get_all_links())
 
-        stats_text = f"""
-📊 *Statistiques*
+        total_links = len(
+            get_all_links()
+        )
 
-📁 Fichiers : {total_files}
-
-🔗 Liens : {total_links}
-
-🔄 Statut : ✅ en ligne
-
-🌐 Mode : Webhook
-"""
+        stats_text = (
+            "📊 Statistiques\n\n"
+            f"📁 Fichiers : {total_files}\n\n"
+            f"🔗 Liens : {total_links}\n\n"
+            "🔄 Statut : ✅ en ligne\n\n"
+            "🌐 Mode : Webhook"
+        )
 
         bot.reply_to(
             message,
-            stats_text,
-            parse_mode="Markdown"
+            stats_text
         )
 
     except Exception as e:
 
-        logger.error(
+        logger.exception(
             f"❌ Erreur /stats : {e}"
         )
 
 
 # ============================================================
-# COMMAND /SAVE
+# /SAVE
 # ============================================================
 
 @bot.message_handler(commands=["save"])
 def save_handler(message):
 
+    logger.info(
+        f"📩 /save reçu de "
+        f"user_id={message.from_user.id}"
+    )
+
     try:
 
-        if not is_admin(message.from_user.id):
+        if not is_admin(
+            message.from_user.id
+        ):
 
             bot.reply_to(
                 message,
@@ -484,57 +602,83 @@ def save_handler(message):
 
     except Exception as e:
 
-        logger.error(
+        logger.exception(
             f"❌ Erreur /save : {e}"
         )
 
-        bot.reply_to(
-            message,
-            f"❌ Erreur sauvegarde : {e}"
-        )
+        try:
+
+            bot.reply_to(
+                message,
+                f"❌ Erreur sauvegarde : {e}"
+            )
+
+        except Exception:
+            pass
 
 
 # ============================================================
 # RÉCEPTION DES FICHIERS TXT
 # ============================================================
 
-@bot.message_handler(content_types=["document"])
+@bot.message_handler(
+    content_types=["document"]
+)
 def document_handler(message):
 
-    if not is_admin(message.from_user.id):
-
-        bot.reply_to(
-            message,
-            "❌ Permission refusée."
-        )
-
-        return
-
-    document = message.document
-
-    if not document.file_name:
-
-        bot.reply_to(
-            message,
-            "❌ Nom du fichier introuvable."
-        )
-
-        return
-
-    if not document.file_name.lower().endswith(".txt"):
-
-        bot.reply_to(
-            message,
-            "❌ Seuls les fichiers `.txt` sont acceptés.",
-            parse_mode="Markdown"
-        )
-
-        return
+    logger.info(
+        f"📥 Document reçu de "
+        f"user_id={message.from_user.id}"
+    )
 
     try:
 
+        if not is_admin(
+            message.from_user.id
+        ):
+
+            bot.reply_to(
+                message,
+                "❌ Permission refusée."
+            )
+
+            return
+
+        document = message.document
+
+        if not document:
+
+            bot.reply_to(
+                message,
+                "❌ Document introuvable."
+            )
+
+            return
+
+        if not document.file_name:
+
+            bot.reply_to(
+                message,
+                "❌ Nom du fichier introuvable."
+            )
+
+            return
+
+        if not document.file_name.lower().endswith(
+            ".txt"
+        ):
+
+            bot.reply_to(
+                message,
+                "❌ Seuls les fichiers .txt "
+                "sont acceptés."
+            )
+
+            return
+
         logger.info(
-            f"📥 Réception fichier : {document.file_name}"
+            f"📥 Téléchargement : "
+            f"{document.file_name}"
         )
 
         file_info = bot.get_file(
@@ -545,10 +689,13 @@ def document_handler(message):
             file_info.file_path
         )
 
-        timestamp = int(time.time())
+        timestamp = int(
+            time.time()
+        )
 
         filename = (
-            f"{timestamp}_{document.file_name}"
+            f"{timestamp}_"
+            f"{document.file_name}"
         )
 
         filepath = os.path.join(
@@ -556,8 +703,14 @@ def document_handler(message):
             filename
         )
 
-        with open(filepath, "wb") as f:
-            f.write(downloaded_file)
+        with open(
+            filepath,
+            "wb"
+        ) as f:
+
+            f.write(
+                downloaded_file
+            )
 
         link_count = 0
 
@@ -572,34 +725,40 @@ def document_handler(message):
 
                 line = line.strip()
 
-                if line and not line.startswith("#"):
+                if (
+                    line
+                    and not line.startswith("#")
+                ):
+
                     link_count += 1
 
         index[filename] = {
-            "original_name": document.file_name,
-            "date_added": datetime.now().isoformat(),
-            "links": link_count,
-            "size": document.file_size
+            "original_name":
+                document.file_name,
+
+            "date_added":
+                datetime.now().isoformat(),
+
+            "links":
+                link_count,
+
+            "size":
+                document.file_size
         }
 
         save_index()
 
         bot.reply_to(
             message,
-            f"""
-✅ *Fichier ajouté !*
-
-📁 {document.file_name}
-
-🔗 {link_count} liens
-
-💾 Index sauvegardé.
-""",
-            parse_mode="Markdown"
+            "✅ Fichier ajouté !\n\n"
+            f"📁 {document.file_name}\n\n"
+            f"🔗 {link_count} liens\n\n"
+            "💾 Index sauvegardé."
         )
 
         logger.info(
-            f"✅ Fichier traité : {filename} "
+            f"✅ Fichier traité : "
+            f"{filename} "
             f"({link_count} liens)"
         )
 
@@ -624,8 +783,15 @@ def document_handler(message):
 # CALLBACKS
 # ============================================================
 
-@bot.callback_query_handler(func=lambda call: True)
+@bot.callback_query_handler(
+    func=lambda call: True
+)
 def callback_handler(call):
+
+    logger.info(
+        f"🔘 Callback reçu : "
+        f"{call.data}"
+    )
 
     try:
 
@@ -641,10 +807,46 @@ def callback_handler(call):
 
 
 # ============================================================
-# ROUTE DE TEST
+# MESSAGE INCONNU
 # ============================================================
 
-@app.route("/", methods=["GET"])
+@bot.message_handler(
+    func=lambda message: True,
+    content_types=[
+        "text"
+    ]
+)
+def unknown_message_handler(message):
+
+    logger.info(
+        f"📩 Message texte non reconnu "
+        f"de user_id={message.from_user.id}: "
+        f"{message.text}"
+    )
+
+    try:
+
+        bot.reply_to(
+            message,
+            "🤖 Commande non reconnue.\n\n"
+            "Utilise /help pour voir les commandes."
+        )
+
+    except Exception as e:
+
+        logger.exception(
+            f"❌ Erreur message inconnu : {e}"
+        )
+
+
+# ============================================================
+# ROUTE PRINCIPALE
+# ============================================================
+
+@app.route(
+    "/",
+    methods=["GET"]
+)
 def home():
 
     return "Bot Telegram M3U OK", 200
@@ -654,7 +856,10 @@ def home():
 # HEALTH CHECK
 # ============================================================
 
-@app.route("/health", methods=["GET"])
+@app.route(
+    "/health",
+    methods=["GET"]
+)
 def health():
 
     return {
@@ -674,15 +879,22 @@ def health():
 )
 def telegram_webhook():
 
-    try:
+    logger.info(
+        "📨 WEBHOOK TELEGRAM REÇU"
+    )
 
-        # Telegram envoie normalement
-        # application/json.
+    try:
 
         if not request.is_json:
 
             logger.warning(
-                "⚠️ Requête webhook non JSON reçue."
+                "⚠️ Webhook reçu mais "
+                "Content-Type n'est pas JSON."
+            )
+
+            logger.warning(
+                f"Content-Type : "
+                f"{request.content_type}"
             )
 
             return "Bad Request", 400
@@ -691,6 +903,77 @@ def telegram_webhook():
             as_text=True
         )
 
+        if not json_string:
+
+            logger.warning(
+                "⚠️ Webhook vide."
+            )
+
+            return "OK", 200
+
+        logger.info(
+            f"📦 Update Telegram reçu "
+            f"({len(json_string)} caractères)"
+        )
+
+        try:
+
+            data = json.loads(
+                json_string
+            )
+
+        except json.JSONDecodeError as e:
+
+            logger.exception(
+                f"❌ JSON Telegram invalide : {e}"
+            )
+
+            return "Bad Request", 400
+
+        # ----------------------------------------------------
+        # Informations de diagnostic
+        # ----------------------------------------------------
+
+        update_keys = list(
+            data.keys()
+        )
+
+        logger.info(
+            f"📋 Type d'update : "
+            f"{update_keys}"
+        )
+
+        if "message" in data:
+
+            msg = data["message"]
+
+            user = msg.get(
+                "from",
+                {}
+            )
+
+            logger.info(
+                "👤 Message Telegram : "
+                f"user_id={user.get('id')} "
+                f"username={user.get('username')} "
+                f"text={msg.get('text')}"
+            )
+
+        elif "callback_query" in data:
+
+            callback = data[
+                "callback_query"
+            ]
+
+            logger.info(
+                "🔘 Callback Telegram reçu : "
+                f"{callback.get('data')}"
+            )
+
+        # ----------------------------------------------------
+        # Conversion Update
+        # ----------------------------------------------------
+
         update = telebot.types.Update.de_json(
             json_string
         )
@@ -698,173 +981,37 @@ def telegram_webhook():
         if update is None:
 
             logger.warning(
-                "⚠️ Update Telegram vide."
+                "⚠️ Impossible de créer "
+                "l'objet Update Telegram."
             )
 
             return "OK", 200
 
-        # Envoie l'update aux handlers
-        # pyTelegramBotAPI.
+        logger.info(
+            f"⚙️ Traitement de l'update "
+            f"id={getattr(update, 'update_id', 'unknown')}"
+        )
+
+        # ----------------------------------------------------
+        # Envoi aux handlers
+        # ----------------------------------------------------
 
         bot.process_new_updates(
             [update]
         )
 
+        logger.info(
+            "✅ Update Telegram traité avec succès."
+        )
+
         return "OK", 200
 
     except Exception as e:
 
         logger.exception(
-            f"❌ Erreur traitement webhook : {e}"
+            f"❌ ERREUR CRITIQUE WEBHOOK : {e}"
         )
 
-        # On renvoie 200 pour éviter que Telegram
-        # réessaie indéfiniment une mise à jour
-        # déjà reçue.
-
-        return "OK", 200
-
-
-# ============================================================
-# CONFIGURATION AUTOMATIQUE DU WEBHOOK
-# ============================================================
-
-def configure_webhook():
-
-    """
-    Configure automatiquement le webhook Telegram.
-
-    Render fournit normalement RENDER_EXTERNAL_URL.
-    On peut également définir WEBHOOK_URL manuellement.
-    """
-
-    webhook_base_url = (
-        os.environ.get("WEBHOOK_URL")
-        or os.environ.get("RENDER_EXTERNAL_URL")
-    )
-
-    if not webhook_base_url:
-
-        logger.warning(
-            "⚠️ WEBHOOK_URL / RENDER_EXTERNAL_URL "
-            "non disponible."
-        )
-
-        return False
-
-    webhook_base_url = webhook_base_url.rstrip("/")
-
-    webhook_url = (
-        f"{webhook_base_url}"
-        f"/telegram/webhook"
-    )
-
-    try:
-
-        # On supprime l'ancien webhook
-        # avant de configurer le nouveau.
-
-        logger.info(
-            "🧹 Suppression de l'ancien webhook..."
-        )
-
-        bot.delete_webhook(
-            drop_pending_updates=False
-        )
-
-        time.sleep(1)
-
-        logger.info(
-            f"🌐 Configuration webhook : {webhook_url}"
-        )
-
-        result = bot.set_webhook(
-            url=webhook_url
-        )
-
-        if result:
-
-            logger.info(
-                "✅ Webhook Telegram configuré avec succès."
-            )
-
-        else:
-
-            logger.error(
-                "❌ Telegram a refusé la configuration du webhook."
-            )
-
-        return result
-
-    except Exception as e:
-
-        logger.exception(
-            f"❌ Erreur configuration webhook : {e}"
-        )
-
-        return False
-
-
-# ============================================================
-# INITIALISATION
-# ============================================================
-
-logger.info("============================================")
-logger.info("🚀 INITIALISATION DU BOT")
-logger.info("============================================")
-
-load_index()
-
-logger.info(
-    f"📊 {len(index)} fichier(s) dans l'index."
-)
-
-try:
-
-    me = bot.get_me()
-
-    logger.info(
-        f"✅ Bot Telegram connecté : "
-        f"@{me.username}"
-    )
-
-except Exception as e:
-
-    logger.error(
-        f"❌ Impossible de contacter Telegram : {e}"
-    )
-
-
-# ============================================================
-# WEBHOOK
-# ============================================================
-
-configure_webhook()
-
-
-logger.info("============================================")
-logger.info("✅ BOT PRÊT")
-logger.info("🌐 MODE : WEBHOOK")
-logger.info("🚫 POLLING : DÉSACTIVÉ")
-logger.info("============================================")
-
-
-# ============================================================
-# LANCEMENT LOCAL UNIQUEMENT
-# ============================================================
-
-if __name__ == "__main__":
-
-    port = int(
-        os.environ.get("PORT", 10000)
-    )
-
-    logger.info(
-        f"🌐 Serveur Flask démarrage sur "
-        f"0.0.0.0:{port}"
-    )
-
-    app.run(
-        host="0.0.0.0",
-        port=port
-    )
+        # On retourne 500 afin que Telegram
+        # puisse éventuellement réessayer.
+        retu
