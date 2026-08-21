@@ -8,6 +8,7 @@ from typing import List, Set, Dict, Optional, Any
 
 import telebot
 from flask import Flask, request
+from supabase import create_client, Client
 
 
 # ============================================================
@@ -35,6 +36,28 @@ if not BOT_TOKEN:
 
 
 # ============================================================
+# SUPABASE CONFIGURATION
+# ============================================================
+
+SUPABASE_URL = os.environ.get("SUPABASE_URL")
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
+
+if not SUPABASE_URL or not SUPABASE_KEY:
+    logger.warning(
+        "⚠️ SUPABASE_URL ou SUPABASE_KEY non définis. "
+        "Le bot fonctionnera sans stockage persistant."
+    )
+    supabase = None
+else:
+    try:
+        supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+        logger.info("✅ Connexion à Supabase établie.")
+    except Exception as e:
+        logger.exception(f"❌ Erreur de connexion à Supabase: {e}")
+        supabase = None
+
+
+# ============================================================
 # ADMIN IDS
 # ============================================================
 
@@ -59,8 +82,6 @@ if not ADMIN_IDS:
 # ============================================================
 
 DATA_FOLDER = "m3u_database"
-INDEX_FILE = "m3u_index.json"
-
 os.makedirs(DATA_FOLDER, exist_ok=True)
 
 
@@ -83,42 +104,131 @@ bot = telebot.TeleBot(
 
 
 # ============================================================
-# DATABASE / INDEX
+# SUPABASE OPERATIONS
 # ============================================================
 
-index = {}
-
-
-def load_index():
-    """Charge l'index depuis le fichier JSON."""
-    global index
-
-    if not os.path.exists(INDEX_FILE):
-        index = {}
-        logger.info("📁 Aucun index local trouvé. Index vide.")
-        return
-
+def get_all_files_from_supabase() -> List[Dict]:
+    """Récupère tous les fichiers depuis Supabase."""
+    if not supabase:
+        return []
+    
     try:
-        with open(INDEX_FILE, "r", encoding="utf-8") as f:
-            index = json.load(f)
-        logger.info(f"📂 Index local chargé : {len(index)} fichiers")
+        response = supabase.table("m3u_files").select("*").execute()
+        return response.data
     except Exception as e:
-        logger.exception(f"❌ Impossible de charger {INDEX_FILE}: {e}")
-        index = {}
+        logger.exception(f"❌ Erreur récupération fichiers Supabase: {e}")
+        return []
 
 
-def save_index():
-    """Sauvegarde l'index dans le fichier JSON."""
+def get_file_from_supabase(filename: str) -> Optional[Dict]:
+    """Récupère un fichier spécifique depuis Supabase."""
+    if not supabase:
+        return None
+    
     try:
-        with open(INDEX_FILE, "w", encoding="utf-8") as f:
-            json.dump(index, f, indent=2, ensure_ascii=False)
-        logger.info("💾 Index sauvegardé localement.")
+        response = supabase.table("m3u_files").select("*").eq("filename", filename).execute()
+        if response.data:
+            return response.data[0]
+        return None
     except Exception as e:
-        logger.exception(f"❌ Erreur sauvegarde index : {e}")
+        logger.exception(f"❌ Erreur récupération fichier {filename}: {e}")
+        return None
 
 
-# Charger l'index au démarrage du module
-load_index()
+def save_file_to_supabase(filename: str, original_name: str, file_content: str, 
+                          links_count: int, file_size: int) -> bool:
+    """Sauvegarde un fichier dans Supabase."""
+    if not supabase:
+        return False
+    
+    try:
+        data = {
+            "filename": filename,
+            "original_name": original_name,
+            "file_content": file_content,
+            "date_added": datetime.now().isoformat(),
+            "links_count": links_count,
+            "file_size": file_size
+        }
+        
+        response = supabase.table("m3u_files").insert(data).execute()
+        return True
+    except Exception as e:
+        logger.exception(f"❌ Erreur sauvegarde fichier {filename}: {e}")
+        return False
+
+
+def delete_file_from_supabase(filename: str) -> bool:
+    """Supprime un fichier de Supabase."""
+    if not supabase:
+        return False
+    
+    try:
+        response = supabase.table("m3u_files").delete().eq("filename", filename).execute()
+        return True
+    except Exception as e:
+        logger.exception(f"❌ Erreur suppression fichier {filename}: {e}")
+        return False
+
+
+def get_all_links_from_supabase() -> Set[str]:
+    """Récupère tous les liens uniques de tous les fichiers dans Supabase."""
+    if not supabase:
+        return set()
+    
+    all_links = set()
+    files = get_all_files_from_supabase()
+    
+    for file_data in files:
+        file_content = file_data.get("file_content", "")
+        if not file_content:
+            continue
+        
+        for line in file_content.split('\n'):
+            line = line.strip()
+            if line and not line.startswith("#"):
+                all_links.add(line)
+    
+    return all_links
+
+
+def search_links_in_supabase(server_url: str) -> List[str]:
+    """
+    Recherche tous les liens correspondant au serveur dans tous les fichiers Supabase.
+    Retourne TOUS les résultats trouvés sans aucune limite.
+    """
+    if not supabase:
+        return []
+    
+    found_lines = []
+    server_clean = normalize_server(server_url)
+    
+    logger.info(f"🔎 Recherche serveur dans Supabase: {server_clean}")
+    
+    files = get_all_files_from_supabase()
+    
+    for file_data in files:
+        file_content = file_data.get("file_content", "")
+        if not file_content:
+            continue
+        
+        try:
+            blocks = re.split(r"━━━━━━━━━━━━━━━━━━", file_content)
+            
+            for block in blocks:
+                block_clean = block.strip()
+                if not block_clean:
+                    continue
+                
+                block_normalized = normalize_server(block_clean)
+                
+                if server_clean in block_normalized or server_clean in block_clean.lower():
+                    found_lines.append(block_clean)
+                    
+        except Exception as e:
+            logger.warning(f"⚠️ Erreur recherche dans fichier {file_data.get('filename')}: {e}")
+    
+    return found_lines
 
 
 # ============================================================
@@ -361,74 +471,12 @@ def build_pagination_markup(chat_id: int, search_id: str, current_page: int, tot
 # OUTILS
 # ============================================================
 
-def get_all_links() -> Set[str]:
-    """Récupère tous les liens uniques de tous les fichiers."""
-    all_links = set()
-
-    for filename in index.keys():
-        filepath = os.path.join(DATA_FOLDER, filename)
-
-        if not os.path.exists(filepath):
-            logger.warning(f"⚠️ Fichier manquant: {filename}")
-            continue
-
-        try:
-            with open(filepath, "r", encoding="utf-8", errors="ignore") as f:
-                for line in f:
-                    line = line.strip()
-                    if line and not line.startswith("#"):
-                        all_links.add(line)
-        except Exception as e:
-            logger.warning(f"⚠️ Erreur lecture {filename}: {e}")
-
-    return all_links
-
-
 def normalize_server(server_url: str) -> str:
     """Normalise l'URL du serveur pour la recherche."""
     server = server_url.strip()
     server = re.sub(r"^https?://", "", server, flags=re.IGNORECASE)
     server = server.rstrip("/")
     return server.lower()
-
-
-def search_links_by_server(server_url: str) -> List[str]:
-    """
-    Recherche tous les liens correspondant au serveur dans tous les fichiers.
-    Retourne TOUS les résultats trouvés sans aucune limite.
-    """
-    found_lines = []
-    server_clean = normalize_server(server_url)
-
-    logger.info(f"🔎 Recherche serveur : {server_clean}")
-
-    for filename in index.keys():
-        filepath = os.path.join(DATA_FOLDER, filename)
-
-        if not os.path.exists(filepath):
-            logger.warning(f"⚠️ Fichier manquant: {filename}")
-            continue
-
-        try:
-            with open(filepath, "r", encoding="utf-8", errors="ignore") as f:
-                content = f.read()
-
-            blocks = re.split(r"━━━━━━━━━━━━━━━━━━", content)
-
-            for block in blocks:
-                block_clean = block.strip()
-                if not block_clean:
-                    continue
-
-                block_normalized = normalize_server(block_clean)
-
-                if server_clean in block_normalized or server_clean in block_clean.lower():
-                    found_lines.append(block_clean)
-
-        except Exception as e:
-            logger.warning(f"⚠️ Erreur recherche dans {filename}: {e}")
-
-    return found_lines
 
 
 def is_admin(user_id: int) -> bool:
@@ -467,7 +515,6 @@ def setup_webhook():
 # Configurer le webhook au démarrage du module
 # Cela fonctionne avec Gunicorn en production
 WEBHOOK_CONFIGURED = setup_webhook()
-
 
 # ============================================================
 # /START
@@ -572,7 +619,7 @@ def m3u_handler(message):
         logger.info(f"🔎 Recherche lancée : {server_url}")
 
         # Récupérer TOUS les résultats sans aucune limite
-        blocks = search_links_by_server(server_url)
+        blocks = search_links_in_supabase(server_url)
 
         logger.info(f"🔎 Résultats trouvés : {len(blocks)}")
 
@@ -655,8 +702,9 @@ def stats_handler(message):
     logger.info(f"📩 /stats reçu de user_id={message.from_user.id}")
 
     try:
-        total_files = len(index)
-        total_links = len(get_all_links())
+        files = get_all_files_from_supabase()
+        total_files = len(files)
+        total_links = len(get_all_links_from_supabase())
 
         stats_text = (
             "📊 Statistiques\n\n"
@@ -684,12 +732,17 @@ def save_handler(message):
             bot.reply_to(message, "❌ Permission refusée.")
             return
 
-        save_index()
-        bot.reply_to(message, "✅ Index sauvegardé localement.")
+        # Sauvegarde manuelle - les données sont déjà dans Supabase
+        # On peut ajouter une vérification de connexion
+        if supabase:
+            bot.reply_to(message, "✅ Les données sont déjà stockées dans Supabase.")
+        else:
+            bot.reply_to(message, "❌ Supabase n'est pas configuré.")
+            
     except Exception as e:
         logger.exception(f"❌ Erreur /save : {e}")
         try:
-            bot.reply_to(message, f"❌ Erreur sauvegarde : {e}")
+            bot.reply_to(message, f"❌ Erreur : {e}")
         except Exception:
             pass
 
@@ -721,6 +774,10 @@ def document_handler(message):
             bot.reply_to(message, "❌ Seuls les fichiers .txt sont acceptés.")
             return
 
+        if not supabase:
+            bot.reply_to(message, "❌ Supabase n'est pas configuré. Impossible de sauvegarder le fichier.")
+            return
+
         logger.info(f"📥 Téléchargement : {document.file_name}")
 
         file_info = bot.get_file(document.file_id)
@@ -728,36 +785,39 @@ def document_handler(message):
 
         timestamp = int(time.time())
         filename = f"{timestamp}_{document.file_name}"
-        filepath = os.path.join(DATA_FOLDER, filename)
 
-        with open(filepath, "wb") as f:
-            f.write(downloaded_file)
+        # Lire le contenu du fichier
+        file_content = downloaded_file.decode('utf-8', errors='ignore')
 
         link_count = 0
-        with open(filepath, "r", encoding="utf-8", errors="ignore") as f:
-            for line in f:
-                line = line.strip()
-                if line and not line.startswith("#"):
-                    link_count += 1
+        for line in file_content.split('\n'):
+            line = line.strip()
+            if line and not line.startswith("#"):
+                link_count += 1
 
-        index[filename] = {
-            "original_name": document.file_name,
-            "date_added": datetime.now().isoformat(),
-            "links": link_count,
-            "size": document.file_size
-        }
-
-        save_index()
-
-        bot.reply_to(
-            message,
-            "✅ Fichier ajouté !\n\n"
-            f"📁 {document.file_name}\n\n"
-            f"🔗 {link_count} liens\n\n"
-            "💾 Index sauvegardé."
+        # Sauvegarder dans Supabase
+        success = save_file_to_supabase(
+            filename=filename,
+            original_name=document.file_name,
+            file_content=file_content,
+            links_count=link_count,
+            file_size=document.file_size
         )
 
-        logger.info(f"✅ Fichier traité : {filename} ({link_count} liens)")
+        if success:
+            bot.reply_to(
+                message,
+                "✅ Fichier ajouté dans Supabase !\n\n"
+                f"📁 {document.file_name}\n\n"
+                f"🔗 {link_count} liens\n\n"
+                "💾 Stockage cloud activé."
+            )
+            logger.info(f"✅ Fichier sauvegardé dans Supabase : {filename} ({link_count} liens)")
+        else:
+            bot.reply_to(
+                message,
+                "❌ Erreur lors de la sauvegarde dans Supabase."
+            )
 
     except Exception as e:
         logger.exception(f"❌ Erreur traitement fichier : {e}")
@@ -940,7 +1000,7 @@ def health():
         "status": "ok",
         "bot": "running",
         "mode": "webhook",
-        "index_size": len(index),
+        "supabase_connected": supabase is not None,
         "webhook_configured": WEBHOOK_CONFIGURED
     }, 200
 
