@@ -3,6 +3,8 @@ import re
 import json
 import time
 import logging
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from typing import List, Set, Dict, Optional, Any
 
@@ -102,47 +104,55 @@ bot = telebot.TeleBot(
     threaded=False
 )
 
+# ============================================================
+# TRAITEMENT WEBHOOK ASYNCHRONE / ANTI-DOUBLON
+# ============================================================
+# Le webhook doit répondre immédiatement à Telegram.
+# Les recherches lourdes sont exécutées hors de la requête Flask.
+WEBHOOK_EXECUTOR = ThreadPoolExecutor(max_workers=1)
+UPDATE_LOCK = threading.Lock()
+PROCESSED_UPDATE_IDS = set()
+MAX_PROCESSED_UPDATE_IDS = 2000
+
 
 # ============================================================
-# SUPABASE OPERATIONS
+# SUPABASE OPERATIONS - VERSION MÉMOIRE OPTIMISÉE
 # ============================================================
 
 def get_all_files_from_supabase() -> List[Dict]:
-    """Récupère tous les fichiers depuis Supabase."""
+    """Récupère uniquement les métadonnées des fichiers.
+
+    IMPORTANT: ne récupère jamais file_content ici.
+    """
     if not supabase:
         return []
-
     try:
-        response = supabase.table("m3u_files").select("*").execute()
-        return response.data
+        response = (
+            supabase.table("m3u_files")
+            .select("filename,original_name,date_added,links_count,file_size")
+            .execute()
+        )
+        return response.data or []
     except Exception as e:
-        logger.exception(f"❌ Erreur récupération fichiers Supabase: {e}")
+        logger.exception(f"❌ Erreur récupération métadonnées Supabase: {e}")
         return []
 
 
 def get_file_from_supabase(filename: str) -> Optional[Dict]:
-    """Récupère un fichier spécifique depuis Supabase."""
+    """Récupère un fichier précis, y compris son contenu, seulement si nécessaire."""
     if not supabase:
         return None
-
     try:
         response = (
-            supabase
-            .table("m3u_files")
-            .select("*")
+            supabase.table("m3u_files")
+            .select("filename,original_name,date_added,links_count,file_size,file_content")
             .eq("filename", filename)
+            .limit(1)
             .execute()
         )
-
-        if response.data:
-            return response.data[0]
-
-        return None
-
+        return response.data[0] if response.data else None
     except Exception as e:
-        logger.exception(
-            f"❌ Erreur récupération fichier {filename}: {e}"
-        )
+        logger.exception(f"❌ Erreur récupération fichier {filename}: {e}")
         return None
 
 
@@ -156,7 +166,6 @@ def save_file_to_supabase(
     """Sauvegarde un fichier dans Supabase."""
     if not supabase:
         return False
-
     try:
         data = {
             "filename": filename,
@@ -166,14 +175,10 @@ def save_file_to_supabase(
             "links_count": links_count,
             "file_size": file_size
         }
-
         supabase.table("m3u_files").insert(data).execute()
         return True
-
     except Exception as e:
-        logger.exception(
-            f"❌ Erreur sauvegarde fichier {filename}: {e}"
-        )
+        logger.exception(f"❌ Erreur sauvegarde fichier {filename}: {e}")
         return False
 
 
@@ -181,96 +186,182 @@ def delete_file_from_supabase(filename: str) -> bool:
     """Supprime un fichier de Supabase."""
     if not supabase:
         return False
-
     try:
-        supabase.table("m3u_files").delete().eq(
-            "filename", filename
-        ).execute()
-
+        supabase.table("m3u_files").delete().eq("filename", filename).execute()
         return True
-
     except Exception as e:
-        logger.exception(
-            f"❌ Erreur suppression fichier {filename}: {e}"
-        )
+        logger.exception(f"❌ Erreur suppression fichier {filename}: {e}")
         return False
 
 
 def get_all_links_from_supabase() -> Set[str]:
-    """Récupère tous les liens uniques de tous les fichiers dans Supabase."""
+    """Compatibilité legacy. Évite select=* mais peut rester coûteux;
+    les statistiques utilisent désormais links_count directement."""
     if not supabase:
         return set()
-
     all_links = set()
-    files = get_all_files_from_supabase()
-
-    for file_data in files:
-        file_content = file_data.get("file_content", "")
-
-        if not file_content:
-            continue
-
-        for line in file_content.split("\n"):
-            line = line.strip()
-
-            if line and not line.startswith("#"):
-                all_links.add(line)
-
+    try:
+        files = get_all_files_from_supabase()
+        for meta in files:
+            filename = meta.get("filename")
+            if not filename:
+                continue
+            row = (
+                supabase.table("m3u_files")
+                .select("file_content")
+                .eq("filename", filename)
+                .limit(1)
+                .execute()
+            )
+            if not row.data:
+                continue
+            content = row.data[0].get("file_content") or ""
+            for line in content.splitlines():
+                line = line.strip()
+                if line and not line.startswith("#"):
+                    all_links.add(line)
+            del content
+    except Exception as e:
+        logger.exception(f"❌ Erreur récupération liens: {e}")
     return all_links
 
 
-def search_links_in_supabase(server_url: str) -> List[str]:
-    """
-    Recherche tous les liens correspondant au serveur
-    dans tous les fichiers Supabase.
+SEARCH_SEPARATOR = "━━━━━━━━━━━━━━━━━━"
+RESULTS_PER_PAGE = 10
+SEARCH_STATE_EXPIRY_SECONDS = 3600
 
-    Retourne TOUS les résultats trouvés sans aucune limite.
-    """
+def iter_blocks(text: str):
+    """Parcourt les blocs sans créer une liste de tous les blocs."""
+    start = 0
+    sep = SEARCH_SEPARATOR
+    while True:
+        pos = text.find(sep, start)
+        if pos == -1:
+            block = text[start:].strip()
+            if block:
+                yield block
+            break
+        block = text[start:pos].strip()
+        if block:
+            yield block
+        start = pos + len(sep)
+
+
+def _get_file_metadata_for_search() -> List[Dict]:
+    """Retourne seulement filename/file_size pour éviter select=* ."""
     if not supabase:
         return []
-
-    found_lines = []
-    server_clean = normalize_server(server_url)
-
-    logger.info(
-        f"🔎 Recherche serveur dans Supabase: {server_clean}"
+    response = (
+        supabase.table("m3u_files")
+        .select("filename,file_size")
+        .execute()
     )
+    return response.data or []
 
-    files = get_all_files_from_supabase()
 
-    for file_data in files:
-        file_content = file_data.get("file_content", "")
+def _get_content_for_one_file(filename: str) -> str:
+    """Charge un seul file_content à la fois."""
+    response = (
+        supabase.table("m3u_files")
+        .select("file_content")
+        .eq("filename", filename)
+        .limit(1)
+        .execute()
+    )
+    if not response.data:
+        return ""
+    return response.data[0].get("file_content") or ""
 
-        if not file_content:
-            continue
 
-        try:
-            blocks = re.split(
-                r"━━━━━━━━━━━━━━━━━━",
-                file_content
-            )
+def search_page_and_count_in_supabase(server_url: str, page: int = 1):
+    """Recherche avec faible empreinte mémoire.
 
-            for block in blocks:
-                block_clean = block.strip()
+    Les métadonnées sont chargées en premier, puis un seul fichier à la fois.
+    Seuls les 10 blocs de la page demandée sont conservés.
+    """
+    if not supabase:
+        return [], 0
 
-                if not block_clean:
+    server_clean = normalize_server(server_url)
+    start_idx = (page - 1) * RESULTS_PER_PAGE
+    end_idx = start_idx + RESULTS_PER_PAGE
+    page_results = []
+    total = 0
+
+    logger.info(f"🔎 Recherche mémoire optimisée: {server_clean} | page={page}")
+
+    try:
+        files = _get_file_metadata_for_search()
+        logger.info(f"📁 {len(files)} fichier(s) à examiner, contenus chargés un par un")
+
+        for meta in files:
+            filename = meta.get("filename")
+            if not filename:
+                continue
+
+            try:
+                content = _get_content_for_one_file(filename)
+                if not content:
                     continue
 
-                block_normalized = normalize_server(block_clean)
+                for block in iter_blocks(content):
+                    block_lower = block.lower()
+                    if server_clean in block_lower:
+                        if start_idx <= total < end_idx:
+                            page_results.append(block)
+                        total += 1
 
-                if (
-                    server_clean in block_normalized
-                    or server_clean in block_clean.lower()
-                ):
-                    found_lines.append(block_clean)
+                # Libération explicite avant de passer au fichier suivant.
+                del content
+            except Exception as e:
+                logger.warning(f"⚠️ Erreur recherche dans {filename}: {e}")
 
-        except Exception as e:
-            logger.warning(
-                f"⚠️ Erreur recherche dans fichier "
-                f"{file_data.get('filename')}: {e}"
-            )
+        logger.info(f"🔎 Recherche terminée: {total} résultat(s), page={page}")
+        return page_results, total
+    except Exception as e:
+        logger.exception(f"❌ Erreur recherche Supabase: {e}")
+        return [], 0
 
-    return found_lines
+
+def search_page_only_in_supabase(server_url: str, page: int):
+    """Récupère une page sans conserver tous les résultats en RAM."""
+    if not supabase:
+        return []
+    server_clean = normalize_server(server_url)
+    start_idx = (page - 1) * RESULTS_PER_PAGE
+    end_idx = start_idx + RESULTS_PER_PAGE
+    results = []
+    seen = 0
+    try:
+        for meta in _get_file_metadata_for_search():
+            filename = meta.get("filename")
+            if not filename:
+                continue
+            content = _get_content_for_one_file(filename)
+            if not content:
+                continue
+            for block in iter_blocks(content):
+                if server_clean in block.lower():
+                    if start_idx <= seen < end_idx:
+                        results.append(block)
+                    seen += 1
+                    if seen >= end_idx:
+                        del content
+                        return results
+            del content
+    except Exception as e:
+        logger.exception(f"❌ Erreur récupération page Supabase: {e}")
+    return results
+
+
+def search_links_in_supabase(server_url: str) -> List[str]:
+    """Compatibilité avec l'ancien code: retourne les résultats, mais bornés."""
+    page, total = search_page_and_count_in_supabase(server_url, 1)
+    if total <= RESULTS_PER_PAGE:
+        return page
+    # Ne jamais reconstruire une énorme liste en mémoire.
+    logger.warning(f"⚠️ search_links_in_supabase legacy limité à {RESULTS_PER_PAGE} résultats")
+    return page
 
 
 # ============================================================
@@ -309,7 +400,7 @@ def get_authenticated_users_from_supabase() -> List[Dict]:
         response = (
             supabase
             .table("authenticated_users")
-            .select("*")
+            .select("user_id,username,first_name,last_name,authenticated_at,last_activity")
             .execute()
         )
 
@@ -419,7 +510,7 @@ def is_user_authenticated(user_id: int) -> bool:
         response = (
             supabase
             .table("authenticated_users")
-            .select("*")
+            .select("user_id,username,first_name,last_name,authenticated_at,last_activity")
             .eq("user_id", user_id)
             .execute()
         )
@@ -756,7 +847,8 @@ def send_paginated_message(
     results: List[str],
     current_page: int,
     total_pages: int,
-    reply_to_message_id: Optional[int] = None
+    reply_to_message_id: Optional[int] = None,
+    total_results_override: Optional[int] = None
 ) -> Dict[str, Any]:
     """
     Envoie un message avec pagination.
@@ -773,7 +865,7 @@ def send_paginated_message(
 
     formatted_text = format_page_results(
         page_results,
-        len(results),
+        total_results_override if total_results_override is not None else len(results),
         current_page,
         total_pages
     )
@@ -1103,60 +1195,20 @@ def configure_webhook_with_retry(
                 )
 
                 if webhook_info.pending_update_count > 0:
-
                     logger.warning(
-                        "⚠️ "
-                        f"{webhook_info.pending_update_count} "
-                        "updates en attente"
+                        f"⚠️ {webhook_info.pending_update_count} update(s) en attente"
                     )
 
                 if webhook_info.last_error_message:
-
-                    logger.error(
-                        "❌ Erreur webhook détectée: "
+                    logger.warning(
+                        "⚠️ Dernière erreur Telegram (informatif): "
                         f"{webhook_info.last_error_message}"
                     )
 
-                    logger.error(
-                        "📅 Date de l'erreur: "
-                        f"{webhook_info.last_error_date}"
-                    )
-
-                    # Telegram fournit last_error_date
-                    # comme timestamp Unix.
-                    if (
-                        webhook_info.last_error_date
-                        and
-                        time.time()
-                        - webhook_info.last_error_date
-                        < 300
-                    ):
-
-                        logger.error(
-                            "⚠️ Erreur récente "
-                            "(< 5 min) - "
-                            "Le webhook peut ne pas fonctionner"
-                        )
-
-                        return False
-
-                    else:
-
-                        logger.info(
-                            "ℹ️ Erreur ancienne, "
-                            "le webhook peut s'être rétabli"
-                        )
-
-                        return True
-
-                else:
-
-                    logger.info(
-                        "✅ Aucune erreur détectée, "
-                        "webhook fonctionnel"
-                    )
-
-                    return True
+                # Le critère fiable ici est que Telegram pointe bien vers
+                # notre URL. Une ancienne erreur 502 ne doit pas empêcher
+                # le démarrage du bot.
+                return True
 
             else:
 
@@ -1320,179 +1372,67 @@ envoyer un fichier .txt (authentification requise)
 # /M3U /SEARCH - TOTALEMENT LIBRE
 # ============================================================
 
-@bot.message_handler(
-    commands=["m3u", "search"]
-)
+@bot.message_handler(commands=["m3u", "search"])
 def m3u_handler(message):
-
-    logger.info(
-        f"📩 Commande recherche reçue : "
-        f"{message.text}"
-    )
-
+    logger.info(f"📩 Commande recherche reçue : {message.text}")
     try:
-
         text = message.text or ""
         parts = text.split(" ", 1)
-
         if len(parts) < 2:
-
-            bot.reply_to(
-                message,
-                "❌ Format incorrect.\n\n"
-                "Utilise :\n"
-                "/m3u http://serveur.com:8080"
-            )
-
+            bot.reply_to(message, "❌ Format incorrect.\n\nUtilise :\n/m3u http://serveur.com:8080")
             return
 
         server_url = parts[1].strip()
-
-        if not (
-            server_url.startswith("http://")
-            or
-            server_url.startswith("https://")
-        ):
-
-            bot.reply_to(
-                message,
-                "❌ URL invalide.\n\n"
-                "Exemple :\n"
-                "http://serveur.com:8080"
-            )
-
+        if not (server_url.startswith("http://") or server_url.startswith("https://")):
+            bot.reply_to(message, "❌ URL invalide.\n\nExemple :\nhttp://serveur.com:8080")
             return
 
-        search_msg = bot.reply_to(
-            message,
-            f"🔍 Recherche pour :\n{server_url}"
-        )
-
-        logger.info(
-            f"🔎 Recherche lancée : {server_url}"
-        )
-
-        blocks = search_links_in_supabase(
-            server_url
-        )
-
-        logger.info(
-            f"🔎 Résultats trouvés : {len(blocks)}"
-        )
-
         chat_id = message.chat.id
+        search_msg = bot.reply_to(message, f"🔍 Recherche pour :\n{server_url}")
 
+        # Un seul état léger: aucun résultat massif n'est conservé en RAM.
         cleanup_expired_states()
-
-        keys_to_remove = []
-
-        for key, state in pagination_state.items():
-
+        for key in list(pagination_state.keys()):
+            state = pagination_state.get(key, {})
             if state.get("chat_id") == chat_id:
+                try:
+                    cleanup_extra_messages(chat_id, state.get("extra_message_ids", []))
+                except Exception:
+                    pass
+                pagination_state.pop(key, None)
 
-                if "extra_message_ids" in state:
+        page_results, total_results = search_page_and_count_in_supabase(server_url, 1)
+        total_pages = get_total_pages(total_results)
+        search_id = generate_search_id(chat_id, int(time.time() * 1000))
 
-                    cleanup_extra_messages(
-                        chat_id,
-                        state["extra_message_ids"]
-                    )
-
-                keys_to_remove.append(key)
-
-        for key in keys_to_remove:
-            del pagination_state[key]
-
-        if blocks:
-
-            total_pages = get_total_pages(
-                len(blocks)
-            )
-
-            current_page = 1
-
-            search_id = generate_search_id(
-                chat_id,
-                int(time.time())
-            )
-
+        if total_results:
             result = send_paginated_message(
-                chat_id,
-                search_id,
-                blocks,
-                current_page,
-                total_pages,
-                search_msg.message_id
+                chat_id, search_id, page_results, 1, total_pages, search_msg.message_id,
+                total_results_override=total_results
             )
-
             pagination_state[search_id] = {
                 "chat_id": chat_id,
-                "results": blocks,
-                "page": current_page,
+                "server_url": server_url,
+                "page": 1,
+                "total_results": total_results,
                 "total_pages": total_pages,
-                "main_message_id": result[
-                    "main_message_id"
-                ],
-                "extra_message_ids": result[
-                    "extra_message_ids"
-                ],
+                "main_message_id": result["main_message_id"],
+                "extra_message_ids": result["extra_message_ids"],
                 "timestamp": time.time()
             }
-
             try:
-
-                bot.delete_message(
-                    chat_id,
-                    search_msg.message_id
-                )
-
-            except Exception as e:
-
-                logger.warning(
-                    "⚠️ Impossible de supprimer "
-                    f"le message temporaire: {e}"
-                )
-
+                bot.delete_message(chat_id, search_msg.message_id)
+            except Exception:
+                pass
         else:
-
-            result_text = (
-                "❌ Aucun résultat trouvé pour :\n"
-                f"{server_url}"
+            bot.edit_message_text(
+                f"❌ Aucun résultat trouvé pour :\n{server_url}",
+                chat_id, search_msg.message_id
             )
-
-            try:
-
-                bot.edit_message_text(
-                    result_text,
-                    search_msg.chat.id,
-                    search_msg.message_id
-                )
-
-            except Exception as e:
-
-                logger.warning(
-                    "⚠️ Impossible de modifier "
-                    f"le message de recherche : {e}"
-                )
-
-                bot.reply_to(
-                    message,
-                    result_text
-                )
-
     except Exception as e:
-
-        logger.exception(
-            f"❌ Erreur commande M3U : {e}"
-        )
-
+        logger.exception(f"❌ Erreur commande M3U : {e}")
         try:
-
-            bot.reply_to(
-                message,
-                "❌ Une erreur est survenue "
-                "pendant la recherche."
-            )
-
+            bot.reply_to(message, "❌ Une erreur est survenue pendant la recherche.")
         except Exception:
             pass
 
@@ -1503,68 +1443,46 @@ def m3u_handler(message):
 
 @bot.message_handler(commands=["stats"])
 def stats_handler(message):
-
-    logger.info(
-        f"📩 /stats reçu de user_id="
-        f"{message.from_user.id}"
-    )
-
+    logger.info(f"📩 /stats reçu de user_id={message.from_user.id}")
     user_id = message.from_user.id
-    chat_type = message.chat.type
-
-    if chat_type == "private":
-
-        if not is_user_authenticated(user_id):
-
-            bot.reply_to(
-                message,
-                "🔐 Accès protégé.\n\n"
-                "Veuillez vous authentifier en envoyant "
-                "le mot de passe en message privé."
-            )
-
+    if message.chat.type != "private":
+        bot.reply_to(message, "🔐 Cette commande est réservée aux utilisateurs authentifiés.\n\nVeuillez utiliser cette commande en conversation privée avec le bot.")
+        return
+    if not is_user_authenticated(user_id):
+        bot.reply_to(message, "🔐 Accès protégé.\n\nVeuillez vous authentifier en envoyant le mot de passe en message privé.")
+        return
+    try:
+        if not supabase:
+            bot.reply_to(message, "❌ Supabase n'est pas configuré.")
             return
 
-    else:
-
-        bot.reply_to(
-            message,
-            "🔐 Cette commande est réservée aux "
-            "utilisateurs authentifiés.\n\n"
-            "Veuillez utiliser cette commande en "
-            "conversation privée avec le bot."
-        )
-
-        return
-
-    try:
-
-        files = get_all_files_from_supabase()
-
-        total_files = len(files)
-
-        total_links = len(
-            get_all_links_from_supabase()
-        )
+        # Seulement les colonnes numériques: aucun file_content n'est chargé.
+        rows = (
+            supabase.table("m3u_files")
+            .select("links_count,file_size")
+            .execute()
+        ).data or []
+        total_files = len(rows)
+        total_links = sum(int(r.get("links_count") or 0) for r in rows)
+        total_size = sum(int(r.get("file_size") or 0) for r in rows)
+        total_mb = total_size / (1024 * 1024)
+        del rows
 
         stats_text = (
             "📊 Statistiques\n\n"
             f"📁 Fichiers : {total_files}\n\n"
-            f"🔗 Liens : {total_links}\n\n"
+            f"🔗 Liens enregistrés : {total_links}\n\n"
+            f"💾 Taille totale : {total_mb:.2f} MB\n\n"
             "🔄 Statut : ✅ en ligne\n\n"
             "🌐 Mode : Webhook"
         )
-
-        bot.reply_to(
-            message,
-            stats_text
-        )
-
+        bot.reply_to(message, stats_text)
     except Exception as e:
-
-        logger.exception(
-            f"❌ Erreur /stats : {e}"
-        )
+        logger.exception(f"❌ Erreur /stats : {e}")
+        try:
+            bot.reply_to(message, "❌ Impossible de récupérer les statistiques.")
+        except Exception:
+            pass
 
 
 # ============================================================
@@ -1928,270 +1846,98 @@ def private_message_handler(message):
 
 
 # ============================================================
-# CALLBACKS
+# CALLBACKS - PAGINATION SANS STOCKAGE DES RÉSULTATS
 # ============================================================
 
-@bot.callback_query_handler(
-    func=lambda call: True
-)
+@bot.callback_query_handler(func=lambda call: True)
 def callback_handler(call):
-
-    logger.info(
-        f"🔘 Callback reçu : {call.data}"
-    )
-
     try:
-
         if call.data == "disabled":
-
-            bot.answer_callback_query(
-                call.id,
-                "❌ Bouton désactivé"
-            )
-
+            bot.answer_callback_query(call.id, "❌ Bouton désactivé")
             return
 
-        if call.data.startswith("page_"):
+        if not call.data.startswith("page_"):
+            bot.answer_callback_query(call.id)
+            return
 
-            # Le search_id contient désormais "|".
-            # split("_", 2) garantit exactement
-            # trois parties maximum:
-            #
-            # ["page", "chat_id|timestamp", "page"]
-            #
-            # Exemple:
-            # page_123456789|1723456789_2
+        parts = call.data.split("_", 2)
+        if len(parts) != 3:
+            bot.answer_callback_query(call.id, "❌ Format de pagination invalide")
+            return
 
-            parts = call.data.split("_", 2)
+        search_id = parts[1]
+        target_page = int(parts[2])
+        cleanup_expired_states()
+        state = pagination_state.get(search_id)
 
-            if len(parts) == 3:
+        if not state:
+            bot.answer_callback_query(call.id, "⚠️ Recherche expirée. Relancez /m3u.")
+            return
+        if state.get("chat_id") != call.message.chat.id:
+            bot.answer_callback_query(call.id, "⚠️ Cette recherche n'est pas dans ce chat.")
+            return
 
-                search_id = parts[1]
-                page_str = parts[2]
+        total_pages = int(state.get("total_pages", 1))
+        if target_page < 1 or target_page > total_pages:
+            bot.answer_callback_query(call.id, "❌ Page invalide")
+            return
 
-                try:
+        page_results = search_page_only_in_supabase(state["server_url"], target_page)
+        total_results = int(state.get("total_results", 0))
 
-                    target_page = int(page_str)
+        cleanup_extra_messages(call.message.chat.id, state.get("extra_message_ids", []))
+        state["extra_message_ids"] = []
+        state["page"] = target_page
+        state["timestamp"] = time.time()
 
-                    cleanup_expired_states()
-
-                    state = pagination_state.get(
-                        search_id
-                    )
-
-                    if state is None:
-
-                        bot.answer_callback_query(
-                            call.id,
-                            "⚠️ Recherche expirée "
-                            "ou inexistante. "
-                            "Relancez la recherche."
-                        )
-
-                        return
-
-                    chat_id = state["chat_id"]
-
-                    if (
-                        chat_id
-                        != call.message.chat.id
-                    ):
-
-                        bot.answer_callback_query(
-                            call.id,
-                            "⚠️ Cette recherche "
-                            "n'est pas dans ce chat."
-                        )
-
-                        return
-
-                    results = state["results"]
-                    total_pages = state["total_pages"]
-
-                    if (
-                        target_page < 1
-                        or
-                        target_page > total_pages
-                    ):
-
-                        bot.answer_callback_query(
-                            call.id,
-                            "❌ Page invalide"
-                        )
-
-                        return
-
-                    if "extra_message_ids" in state:
-
-                        cleanup_extra_messages(
-                            chat_id,
-                            state[
-                                "extra_message_ids"
-                            ]
-                        )
-
-                        state[
-                            "extra_message_ids"
-                        ] = []
-
-                    state["page"] = target_page
-
-                    page_results = get_page_results(
-                        results,
-                        target_page
-                    )
-
-                    formatted_text = (
-                        format_page_results(
-                            page_results,
-                            len(results),
-                            target_page,
-                            total_pages
-                        )
-                    )
-
-                    markup = build_pagination_markup(
-                        chat_id,
-                        search_id,
-                        target_page,
-                        total_pages
-                    )
-
-                    if len(formatted_text) > 4000:
-
-                        chunks = split_text_into_chunks(
-                            formatted_text,
-                            4000
-                        )
-
-                        try:
-
-                            bot.edit_message_text(
-                                chunks[0],
-                                call.message.chat.id,
-                                call.message.message_id,
-                                reply_markup=markup
-                            )
-
-                        except Exception as e:
-
-                            logger.warning(
-                                "⚠️ Erreur lors de "
-                                f"l'édition du message : {e}"
-                            )
-
-                            new_msg = bot.send_message(
-                                call.message.chat.id,
-                                chunks[0],
-                                reply_markup=markup
-                            )
-
-                            state[
-                                "main_message_id"
-                            ] = new_msg.message_id
-
-                            try:
-
-                                bot.delete_message(
-                                    call.message.chat.id,
-                                    call.message.message_id
-                                )
-
-                            except Exception:
-                                pass
-
-                        extra_ids = []
-
-                        for chunk in chunks[1:]:
-
-                            extra_msg = bot.send_message(
-                                call.message.chat.id,
-                                chunk
-                            )
-
-                            extra_ids.append(
-                                extra_msg.message_id
-                            )
-
-                        state[
-                            "extra_message_ids"
-                        ] = extra_ids
-
-                    else:
-
-                        try:
-
-                            bot.edit_message_text(
-                                formatted_text,
-                                call.message.chat.id,
-                                call.message.message_id,
-                                reply_markup=markup
-                            )
-
-                        except Exception as e:
-
-                            logger.warning(
-                                "⚠️ Erreur lors de "
-                                f"l'édition du message : {e}"
-                            )
-
-                            new_msg = bot.send_message(
-                                call.message.chat.id,
-                                formatted_text,
-                                reply_markup=markup
-                            )
-
-                            state[
-                                "main_message_id"
-                            ] = new_msg.message_id
-
-                            try:
-
-                                bot.delete_message(
-                                    call.message.chat.id,
-                                    call.message.message_id
-                                )
-
-                            except Exception:
-                                pass
-
-                    bot.answer_callback_query(
-                        call.id
-                    )
-
-                except ValueError:
-
-                    bot.answer_callback_query(
-                        call.id,
-                        "❌ Erreur de pagination"
-                    )
-
-            else:
-
-                bot.answer_callback_query(
-                    call.id,
-                    "❌ Format de pagination invalide"
-                )
-
-        else:
-
-            bot.answer_callback_query(
-                call.id
-            )
-
-    except Exception as e:
-
-        logger.warning(
-            f"⚠️ Erreur callback : {e}"
+        formatted_text = format_page_results(page_results, total_results, target_page, total_pages)
+        markup = build_pagination_markup(
+            call.message.chat.id, search_id, target_page, total_pages
         )
 
+        if len(formatted_text) <= 4000:
+            try:
+                bot.edit_message_text(
+                    formatted_text,
+                    call.message.chat.id,
+                    call.message.message_id,
+                    reply_markup=markup
+                )
+                state["main_message_id"] = call.message.message_id
+            except Exception as e:
+                logger.warning(f"⚠️ Erreur édition pagination: {e}")
+                new_msg = bot.send_message(
+                    call.message.chat.id, formatted_text, reply_markup=markup
+                )
+                state["main_message_id"] = new_msg.message_id
+        else:
+            chunks = split_text_into_chunks(formatted_text, 4000)
+            try:
+                bot.edit_message_text(
+                    chunks[0], call.message.chat.id, call.message.message_id, reply_markup=markup
+                )
+                state["main_message_id"] = call.message.message_id
+            except Exception:
+                new_msg = bot.send_message(
+                    call.message.chat.id, chunks[0], reply_markup=markup
+                )
+                state["main_message_id"] = new_msg.message_id
+            extra_ids = []
+            for chunk in chunks[1:]:
+                extra_ids.append(bot.send_message(call.message.chat.id, chunk).message_id)
+            state["extra_message_ids"] = extra_ids
+
+        bot.answer_callback_query(call.id)
+    except (ValueError, KeyError) as e:
+        logger.warning(f"⚠️ Erreur pagination: {e}")
         try:
-
-            bot.answer_callback_query(
-                call.id,
-                "❌ Erreur lors du traitement"
-            )
-
+            bot.answer_callback_query(call.id, "❌ Erreur de pagination")
+        except Exception:
+            pass
+    except Exception as e:
+        logger.exception(f"❌ Erreur callback : {e}")
+        try:
+            bot.answer_callback_query(call.id, "❌ Erreur lors du traitement")
         except Exception:
             pass
 
@@ -2268,232 +2014,64 @@ def health():
 
 
 # ============================================================
-# WEBHOOK TELEGRAM
+# WEBHOOK TELEGRAM - RÉPONSE IMMÉDIATE
 # ============================================================
 
-@app.route(
-    "/telegram/webhook",
-    methods=["POST"]
-)
-def telegram_webhook():
-
-    logger.info(
-        "📨 WEBHOOK TELEGRAM REÇU"
-    )
-
-    logger.info(
-        f"📨 Headers: {dict(request.headers)}"
-    )
-
+def _process_update_background(update, update_id):
     try:
+        logger.info(f"⚙️ Traitement asynchrone update_id={update_id}")
+        bot.process_new_updates([update])
+        logger.info(f"✅ Update {update_id} traité en arrière-plan")
+    except Exception as e:
+        logger.exception(f"❌ Erreur traitement update {update_id}: {e}")
+    finally:
+        # On garde l'ID dans PROCESSED_UPDATE_IDS pour empêcher un retraitement.
+        pass
 
+
+@app.route("/telegram/webhook", methods=["POST"])
+def telegram_webhook():
+    """Accuse réception immédiatement puis traite Telegram hors requête HTTP.
+
+    Cela évite que Telegram obtienne un 502 si /m3u prend longtemps ou si
+    la recherche est interrompue par Render.
+    """
+    try:
         if not request.is_json:
+            return "Bad Request", 400
 
-            logger.warning(
-                "⚠️ Webhook reçu mais "
-                "Content-Type n'est pas JSON. "
-                f"Content-Type: {request.content_type}"
-            )
+        data = request.get_json(silent=True)
+        if not data:
+            return "OK", 200
 
-            return (
-                "Bad Request",
-                400
-            )
+        update_id = data.get("update_id")
+        if update_id is None:
+            return "OK", 200
 
-        json_string = request.get_data(
-            as_text=True
-        )
+        with UPDATE_LOCK:
+            if update_id in PROCESSED_UPDATE_IDS:
+                logger.info(f"♻️ Update déjà reçu, ignoré: {update_id}")
+                return "OK", 200
+            PROCESSED_UPDATE_IDS.add(update_id)
+            if len(PROCESSED_UPDATE_IDS) > MAX_PROCESSED_UPDATE_IDS:
+                # Nettoyage simple et borné. Les IDs Telegram sont croissants.
+                oldest = sorted(PROCESSED_UPDATE_IDS)[:500]
+                for old_id in oldest:
+                    PROCESSED_UPDATE_IDS.discard(old_id)
 
-        if not json_string:
-
-            logger.warning(
-                "⚠️ Webhook vide."
-            )
-
-            return (
-                "OK",
-                200
-            )
-
-        logger.info(
-            "📦 1. Update Telegram reçu"
-        )
-
-        logger.info(
-            f"📦 2. Longueur: "
-            f"{len(json_string)} caractères"
-        )
-
-        try:
-
-            data = json.loads(
-                json_string
-            )
-
-            logger.info(
-                "📦 3. JSON parsé avec succès"
-            )
-
-        except json.JSONDecodeError as e:
-
-            logger.exception(
-                f"❌ JSON Telegram invalide : {e}"
-            )
-
-            return (
-                "Bad Request",
-                400
-            )
-
-        update_keys = list(
-            data.keys()
-        )
-
-        logger.info(
-            f"📋 4. Type d'update : "
-            f"{update_keys}"
-        )
-
-        if "message" in data:
-
-            msg = data["message"]
-            user = msg.get(
-                "from",
-                {}
-            )
-
-            logger.info(
-                "👤 5. Message Telegram : "
-                f"user_id={user.get('id')} "
-                f"username={user.get('username')} "
-                f"chat_type="
-                f"{msg.get('chat', {}).get('type')}"
-            )
-
-            # IMPORTANT:
-            # Le contenu des messages privés est
-            # volontairement masqué dans les logs
-            # afin de ne jamais exposer le mot de passe.
-
-            text = msg.get(
-                "text",
-                ""
-            )
-
-            if (
-                text
-                and
-                not text.startswith("/")
-            ):
-
-                logger.info(
-                    "📝 6. Message texte "
-                    "non-commande reçu "
-                    "(contenu masqué)"
-                )
-
-            elif (
-                text
-                and
-                text.startswith("/")
-            ):
-
-                logger.info(
-                    f"📝 6. Commande reçue: "
-                    f"{text.split()[0]}"
-                )
-
-        elif "callback_query" in data:
-
-            callback = data[
-                "callback_query"
-            ]
-
-            logger.info(
-                "🔘 5. Callback Telegram reçu : "
-                f"{callback.get('data')}"
-            )
-
-        logger.info(
-            "🔄 7. Tentative de conversion "
-            "Update.de_json()"
-        )
-
-        update = telebot.types.Update.de_json(
-            json_string
-        )
-
-        # Récupération robuste de l'update_id
-        update_id = getattr(update, 'update_id', None)
-        update_id_str = str(update_id) if update_id is not None else 'None'
-
-        logger.info(
-            f"📦 8. Update créé: "
-            f"update_id={update_id_str}"
-        )
-
+        update = telebot.types.Update.de_json(json.dumps(data))
         if update is None:
+            return "OK", 200
 
-            logger.warning(
-                "⚠️ 9. Update est None - "
-                "Impossible de créer l'objet "
-                "Update Telegram."
-            )
-
-            return (
-                "OK",
-                200
-            )
-
-        logger.info(
-            "⚙️ 10. Traitement de l'update "
-            f"id={update_id_str}"
-        )
-
-        logger.info(
-            f"📋 11. Handlers message: "
-            f"{len(bot.message_handlers)}"
-        )
-
-        logger.info(
-            f"📋 12. Handlers callback: "
-            f"{len(bot.callback_query_handlers)}"
-        )
-
-        logger.info(
-            "➡️ 13. AVANT "
-            "bot.process_new_updates()"
-        )
-
-        bot.process_new_updates(
-            [update]
-        )
-
-        logger.info(
-            "⬅️ 14. APRÈS "
-            "bot.process_new_updates()"
-        )
-
-        logger.info(
-            "✅ 15. Update Telegram "
-            "traité avec succès."
-        )
-
-        return (
-            "OK",
-            200
-        )
+        logger.info(f"📨 Webhook accepté immédiatement: update_id={update_id}")
+        WEBHOOK_EXECUTOR.submit(_process_update_background, update, update_id)
+        return "OK", 200
 
     except Exception as e:
-
-        logger.exception(
-            f"❌ ERREUR CRITIQUE WEBHOOK : {e}"
-        )
-
-        return (
-            "Internal Server Error",
-            500
-        )
+        logger.exception(f"❌ ERREUR WEBHOOK : {e}")
+        # Pour une erreur de traitement interne, on évite de provoquer une
+        # boucle de retries Telegram qui pourrait aggraver la charge.
+        return "OK", 200
 
 
 # ============================================================
