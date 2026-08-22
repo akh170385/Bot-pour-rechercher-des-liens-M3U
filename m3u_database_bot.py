@@ -788,13 +788,7 @@ def require_auth(func):
 
         elif chat_type in ["group", "supergroup"]:
 
-            bot.reply_to(
-                message,
-                "🔐 Cette commande est réservée aux "
-                "utilisateurs authentifiés.\n\n"
-                "Veuillez utiliser cette commande en "
-                "conversation privée avec le bot."
-            )
+            # Silence volontaire dans un groupe.
             return
 
         return func(message, *args, **kwargs)
@@ -1794,14 +1788,9 @@ def stats_handler(message):
 
     else:
 
-        bot.reply_to(
-            message,
-            "🔐 Cette commande est réservée aux "
-            "utilisateurs authentifiés.\n\n"
-            "Veuillez utiliser cette commande en "
-            "conversation privée avec le bot."
-        )
-
+        # Silence volontaire dans un groupe : aucune réponse,
+        # pour ne pas révéler l'existence de cette commande
+        # admin/privée aux membres du groupe.
         return
 
     try:
@@ -1882,14 +1871,9 @@ def reindex_handler(message):
 
     else:
 
-        bot.reply_to(
-            message,
-            "🔐 Cette commande est réservée aux "
-            "utilisateurs authentifiés.\n\n"
-            "Veuillez utiliser cette commande en "
-            "conversation privée avec le bot."
-        )
-
+        # Silence volontaire dans un groupe : aucune réponse,
+        # pour ne pas révéler l'existence de cette commande
+        # admin/privée aux membres du groupe.
         return
 
     try:
@@ -2509,9 +2493,15 @@ def callback_handler(call):
 # ============================================================
 # MESSAGE INCONNU
 # ============================================================
+# Ne réagit qu'en conversation privée avec le bot. Dans un groupe,
+# le bot reste totalement silencieux pour tout ce qui n'est pas
+# une commande explicitement gérée (comme /m3u) — un membre qui
+# colle un lien, écrit un message normal, ou tape une commande
+# inconnue ne provoque plus aucune réponse du bot.
 
 @bot.message_handler(
-    func=lambda message: True,
+    func=lambda message:
+        message.chat.type == "private",
     content_types=["text"]
 )
 def unknown_message_handler(message):
