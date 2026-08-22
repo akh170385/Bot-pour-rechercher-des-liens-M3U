@@ -252,12 +252,27 @@ def search_links_in_supabase(server_url: str) -> List[str]:
     if not supabase:
         return []
 
-    found_lines = []
     server_clean = normalize_server(server_url)
 
     logger.info(
         f"🔎 Recherche serveur dans Supabase: {server_clean}"
     )
+
+    # 1) Chemin rapide : recherche SQL côté Supabase sur l'index de
+    # blocs (si la migration a été appliquée). Aucune donnée n'est
+    # rapatriée/reparse en Python dans ce cas.
+    rpc_results = search_blocks_via_rpc(server_clean)
+
+    if rpc_results is not None:
+        logger.info(
+            f"🔎 Résultats via index SQL : {len(rpc_results)}"
+        )
+        return rpc_results
+
+    # 2) Repli legacy : ancienne méthode (rapatrie et reparse tout
+    # le contenu de tous les fichiers en Python). Toujours
+    # fonctionnelle même sans migration SQL.
+    found_lines = []
 
     files = get_all_files_from_supabase()
 
@@ -294,6 +309,200 @@ def search_links_in_supabase(server_url: str) -> List[str]:
             )
 
     return found_lines
+
+
+# ============================================================
+# INDEXATION PAR BLOCS (recherche déportée côté Supabase)
+# ============================================================
+# But : au lieu de retélécharger et reparser TOUT le contenu de TOUS
+# les fichiers à chaque /m3u (coûteux en CPU/RAM sur un serveur
+# limité), on découpe chaque fichier en blocs UNE SEULE FOIS, à
+# l'upload, et on les stocke dans une table dédiée `m3u_blocks`
+# avec une colonne déjà normalisée. La recherche devient alors une
+# requête SQL (idéalement via une fonction RPC utilisant un index
+# trigram côté Postgres), exécutée par Supabase et non par ce
+# process Python.
+#
+# Si la table/fonction SQL n'existe pas encore (migration non
+# appliquée), tout retombe silencieusement sur l'ancienne méthode
+# `search_links_in_supabase` : aucun comportement existant n'est
+# cassé, la recherche est juste plus rapide une fois la migration
+# faite.
+
+BLOCK_SEPARATOR = "━━━━━━━━━━━━━━━━━━"
+
+SEARCH_RPC_FUNCTION = "search_m3u_blocks"
+BLOCKS_TABLE = "m3u_blocks"
+
+# Bascule interne : si un appel RPC échoue une fois (table/fonction
+# absente), on évite de retenter en boucle sur chaque recherche
+# suivante et on repasse directement en mode legacy jusqu'au
+# prochain redémarrage.
+_rpc_search_available = True
+
+
+def split_file_into_blocks(file_content: str) -> List[str]:
+    """
+    Découpe le contenu d'un fichier en blocs, exactement comme le
+    fait déjà `search_links_in_supabase` (même séparateur), pour
+    garantir un comportement de recherche identique une fois
+    indexé en base.
+    """
+    if not file_content:
+        return []
+
+    blocks = re.split(
+        re.escape(BLOCK_SEPARATOR),
+        file_content
+    )
+
+    return [
+        block.strip()
+        for block in blocks
+        if block.strip()
+    ]
+
+
+def index_blocks_for_file(
+    filename: str,
+    file_content: str
+) -> bool:
+    """
+    Construit l'index de recherche pour UN fichier : découpe en
+    blocs, normalise chaque bloc, et les insère dans `m3u_blocks`.
+
+    Appelée une seule fois par upload (et par /reindex pour les
+    fichiers déjà existants) — jamais à chaque recherche. C'est ce
+    qui déplace le coût CPU/mémoire de "à chaque /m3u" vers "à
+    chaque ajout de fichier", bien plus rare.
+
+    Idempotente : les anciens blocs du même filename sont
+    supprimés avant réinsertion, donc rejouable sans dupliquer.
+    """
+    if not supabase:
+        return False
+
+    blocks = split_file_into_blocks(file_content)
+
+    if not blocks:
+        return True
+
+    try:
+        # Supprime les blocs existants de ce fichier avant de les
+        # recréer, pour rester idempotent (utile pour /reindex).
+        supabase.table(BLOCKS_TABLE).delete().eq(
+            "filename", filename
+        ).execute()
+
+        rows = [
+            {
+                "filename": filename,
+                "block_content": block,
+                "block_normalized": normalize_server(block)
+            }
+            for block in blocks
+        ]
+
+        # Insertion par lots pour rester sous les limites de taille
+        # de requête de Supabase/PostgREST sur les gros fichiers.
+        batch_size = 500
+
+        for i in range(0, len(rows), batch_size):
+            batch = rows[i:i + batch_size]
+            supabase.table(BLOCKS_TABLE).insert(batch).execute()
+
+        logger.info(
+            f"🧱 Indexation terminée pour {filename} : "
+            f"{len(rows)} bloc(s)"
+        )
+
+        return True
+
+    except Exception as e:
+        logger.warning(
+            "⚠️ Indexation par blocs impossible pour "
+            f"{filename} (table '{BLOCKS_TABLE}' absente ? "
+            f"migration SQL non appliquée ?) : {e}"
+        )
+
+        return False
+
+
+def search_blocks_via_rpc(server_clean: str) -> Optional[List[str]]:
+    """
+    Recherche les blocs correspondants via la fonction SQL
+    `search_m3u_blocks`, exécutée côté Supabase (index trigram).
+
+    Retourne None si le RPC n'est pas disponible (migration non
+    faite), afin que l'appelant sache qu'il doit basculer sur
+    l'ancienne méthode — jamais d'exception qui remonte.
+    """
+    global _rpc_search_available
+
+    if not supabase or not _rpc_search_available:
+        return None
+
+    try:
+        response = supabase.rpc(
+            SEARCH_RPC_FUNCTION,
+            {"search_term": server_clean}
+        ).execute()
+
+        return [
+            row["block_content"]
+            for row in (response.data or [])
+        ]
+
+    except Exception as e:
+        logger.warning(
+            "⚠️ Recherche via RPC Supabase indisponible "
+            "(migration SQL probablement non appliquée) — "
+            f"repli sur l'ancienne méthode. Détail : {e}"
+        )
+
+        # Évite de retenter le RPC à chaque recherche suivante tant
+        # que le process tourne : on sait déjà qu'il échoue.
+        _rpc_search_available = False
+
+        return None
+
+
+def reindex_all_files() -> Dict[str, int]:
+    """
+    Reconstruit l'index de blocs pour TOUS les fichiers déjà
+    présents dans `m3u_files`. À exécuter une fois après avoir
+    appliqué la migration SQL, pour les fichiers uploadés avant
+    la mise en place de l'indexation.
+    """
+    global _rpc_search_available
+
+    files = get_all_files_from_supabase()
+
+    success_count = 0
+    fail_count = 0
+
+    for file_data in files:
+        filename = file_data.get("filename")
+        file_content = file_data.get("file_content", "")
+
+        if not filename:
+            continue
+
+        if index_blocks_for_file(filename, file_content):
+            success_count += 1
+        else:
+            fail_count += 1
+
+    if success_count > 0:
+        # Si au moins un fichier a pu être indexé, la table existe
+        # bien : on réautorise les tentatives de recherche RPC.
+        _rpc_search_available = True
+
+    return {
+        "total": len(files),
+        "success": success_count,
+        "failed": fail_count
+    }
 
 
 # ============================================================
@@ -1269,6 +1478,9 @@ Affiche les statistiques.
 💾 /save
 Sauvegarde manuelle (admin).
 
+🧱 /reindex
+Reconstruit l'index de recherche rapide (admin).
+
 📤 Envoyer un fichier .txt
 Ajoute des liens (admin).
 
@@ -1316,6 +1528,8 @@ def help_handler(message):
 📊 /stats (authentification requise)
 
 💾 /save (authentification requise)
+
+🧱 /reindex (authentification requise, admin)
 
 📤 Administrateur :
 envoyer un fichier .txt (authentification requise)
@@ -1675,6 +1889,114 @@ def save_handler(message):
 
 
 # ============================================================
+# /REINDEX - PROTÉGÉ PAR AUTHENTIFICATION ET ADMIN_IDS
+# ============================================================
+# Reconstruit l'index de blocs (table m3u_blocks) pour tous les
+# fichiers déjà présents. À exécuter UNE FOIS après avoir appliqué
+# la migration SQL, pour couvrir les fichiers uploadés avant la
+# mise en place de l'indexation. Les nouveaux uploads sont indexés
+# automatiquement (voir document_handler), donc /reindex n'a pas
+# besoin d'être relancé ensuite, sauf en cas de doute.
+
+@bot.message_handler(commands=["reindex"])
+def reindex_handler(message):
+
+    logger.info(
+        f"📩 /reindex reçu de user_id="
+        f"{message.from_user.id}"
+    )
+
+    user_id = message.from_user.id
+    chat_type = message.chat.type
+
+    if chat_type == "private":
+
+        if not is_user_authenticated(user_id):
+
+            bot.reply_to(
+                message,
+                "🔐 Accès protégé.\n\n"
+                "Veuillez vous authentifier en envoyant "
+                "le mot de passe en message privé."
+            )
+
+            return
+
+    else:
+
+        bot.reply_to(
+            message,
+            "🔐 Cette commande est réservée aux "
+            "utilisateurs authentifiés.\n\n"
+            "Veuillez utiliser cette commande en "
+            "conversation privée avec le bot."
+        )
+
+        return
+
+    try:
+
+        if not is_admin(user_id):
+
+            bot.reply_to(
+                message,
+                "❌ Permission refusée. "
+                "Vous n'êtes pas administrateur."
+            )
+
+            return
+
+        if not supabase:
+
+            bot.reply_to(
+                message,
+                "❌ Supabase n'est pas configuré."
+            )
+
+            return
+
+        progress_msg = bot.reply_to(
+            message,
+            "🧱 Reconstruction de l'index en cours..."
+        )
+
+        result = reindex_all_files()
+
+        bot.edit_message_text(
+            "✅ Réindexation terminée.\n\n"
+            f"📁 Fichiers traités : {result['total']}\n"
+            f"🧱 Indexés avec succès : {result['success']}\n"
+            f"⚠️ Échecs : {result['failed']}\n\n"
+            + (
+                "La table 'm3u_blocks' semble introuvable — "
+                "as-tu bien exécuté la migration SQL dans "
+                "Supabase ?"
+                if result["success"] == 0 and result["total"] > 0
+                else "La recherche /m3u utilisera désormais "
+                "l'index SQL rapide."
+            ),
+            progress_msg.chat.id,
+            progress_msg.message_id
+        )
+
+    except Exception as e:
+
+        logger.exception(
+            f"❌ Erreur /reindex : {e}"
+        )
+
+        try:
+
+            bot.reply_to(
+                message,
+                f"❌ Erreur : {e}"
+            )
+
+        except Exception:
+            pass
+
+
+# ============================================================
 # RÉCEPTION DES FICHIERS TXT
 # ============================================================
 
@@ -1816,6 +2138,13 @@ def document_handler(message):
         )
 
         if success:
+
+            # Indexation par blocs pour une recherche rapide côté
+            # Supabase. Ne bloque jamais l'upload : si la migration
+            # SQL n'a pas encore été appliquée, cette étape échoue
+            # proprement et search_links_in_supabase retombera sur
+            # l'ancienne méthode.
+            index_blocks_for_file(filename, file_content)
 
             bot.reply_to(
                 message,
