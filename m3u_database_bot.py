@@ -1504,6 +1504,12 @@ def start_handler(message):
         f"{message.from_user.id}"
     )
 
+    if message.chat.type != "private":
+
+        # Silence volontaire dans un groupe : /start ne doit
+        # apparaître que dans la conversation privée avec le bot.
+        return
+
     welcome_text = """
 😎 𝙱𝙾𝚃 𝙶𝙾𝙻𝙳𝙴𝙽 𝚂𝙷𝙴𝙴𝙿
 
@@ -1545,6 +1551,12 @@ def help_handler(message):
         f"📩 /help reçu de user_id="
         f"{message.from_user.id}"
     )
+
+    if message.chat.type != "private":
+
+        # Silence volontaire dans un groupe : /help ne doit
+        # apparaître que dans la conversation privée avec le bot.
+        return
 
     help_text = """
 🤖 Aide
