@@ -1511,25 +1511,12 @@ def start_handler(message):
     )
 
     welcome_text = """
-🤖 Bot M3U Database
+😎 𝙱𝙾𝚃 𝙶𝙾𝙻𝙳𝙴𝙽 𝚂𝙷𝙴𝙴𝙿
 
-📋 Commandes publiques :
+👁️ Commandes publiques autorisé :
 
-🔍 /m3u <serveur>
+🧐 /m3u <serveur>
 Recherche des liens M3U (accessible à tous)
-
-📋 Commandes privées (authentification requise) :
-
-📊 /stats
-Affiche les statistiques.
-
-🧱 /reindex
-Reconstruit l'index de recherche rapide (admin).
-
-📤 Envoyer un fichier .txt
-Ajoute des liens (admin).
-
-🔐 Pour accéder aux fonctions privées, envoyez le mot de passe en message privé.
 """
 
     try:
