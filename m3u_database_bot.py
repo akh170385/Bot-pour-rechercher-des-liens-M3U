@@ -666,8 +666,11 @@ def split_text_into_chunks(
     max_length: int = 4000
 ) -> List[str]:
     """
-    Divise un texte en plusieurs morceaux
-    sans couper les lignes.
+    Découpe un texte long sans dépasser la limite Telegram.
+
+    Cette fonction reste disponible comme utilitaire générique. La
+    pagination des résultats utilise désormais build_page_message_chunks(),
+    qui évite de couper un résultat [N] lorsqu'il tient dans un message.
     """
 
     if len(text) <= max_length:
@@ -685,36 +688,24 @@ def split_text_into_chunks(
                 chunks.append(current_chunk)
                 current_chunk = ""
 
-            for i in range(
-                0,
-                len(line),
-                max_length - 100
-            ):
-                chunks.append(
-                    line[
-                        i:i + max_length - 100
-                    ]
-                )
+            # Cas exceptionnel : une ligne seule dépasse la limite Telegram.
+            step = max(1, max_length - 100)
+            for i in range(0, len(line), step):
+                chunks.append(line[i:i + step])
 
             continue
 
-        if (
-            len(current_chunk)
-            + len(line)
-            + 1
-            <= max_length
-        ):
+        candidate = (
+            f"{current_chunk}\n{line}"
+            if current_chunk
+            else line
+        )
 
-            if current_chunk:
-                current_chunk += "\n" + line
-            else:
-                current_chunk = line
-
+        if len(candidate) <= max_length:
+            current_chunk = candidate
         else:
-
             if current_chunk:
                 chunks.append(current_chunk)
-
             current_chunk = line
 
     if current_chunk:
@@ -729,7 +720,7 @@ def format_page_results(
     current_page: int,
     total_pages: int
 ) -> str:
-    """Formate les résultats d'une page."""
+    """Formate une page complète de résultats."""
 
     result_text = (
         f"✅ {total_results} résultat(s) trouvé(s)\n"
@@ -750,6 +741,75 @@ def format_page_results(
         )
 
     return result_text
+
+
+def build_page_message_chunks(
+    results: List[str],
+    total_results: int,
+    current_page: int,
+    total_pages: int,
+    max_length: int = 4000
+) -> List[str]:
+    """
+    Construit les messages Telegram d'une page sans couper les résultats.
+
+    Chaque résultat [N] est traité comme un bloc atomique. Plusieurs
+    résultats sont regroupés dans le même message tant que la limite
+    Telegram est respectée.
+
+    Le bouton « ➡️ Suivant » est ajouté uniquement au dernier message de
+    la page par send_page_messages().
+
+    Si un résultat individuel dépasse la limite Telegram, il est découpé
+    en dernier recours, car Telegram refuse les messages trop longs.
+    Les résultats normaux restent donc entièrement intacts.
+    """
+
+    header = (
+        f"✅ {total_results} résultat(s) trouvé(s)\n"
+        f"📄 Page {current_page} / {total_pages}\n\n"
+    )
+
+    chunks: List[str] = []
+    current_chunk = header
+
+    for i, block in enumerate(results, 1):
+
+        global_idx = (
+            (current_page - 1)
+            * RESULTS_PER_PAGE
+            + i
+        )
+
+        result_block = (
+            f"[{global_idx}]\n"
+            f"{block}\n\n"
+        )
+
+        candidate = current_chunk + result_block
+
+        if len(candidate) <= max_length:
+            current_chunk = candidate
+            continue
+
+        if current_chunk.strip():
+            chunks.append(current_chunk.rstrip())
+
+        # Un résultat individuel normal doit rester entier.
+        if len(result_block) > max_length:
+            oversized_parts = split_text_into_chunks(
+                result_block,
+                max_length
+            )
+            chunks.extend(oversized_parts[:-1])
+            current_chunk = oversized_parts[-1]
+        else:
+            current_chunk = result_block
+
+    if current_chunk.strip():
+        chunks.append(current_chunk.rstrip())
+
+    return chunks or [header.rstrip()]
 
 
 def cleanup_extra_messages(
@@ -773,6 +833,75 @@ def cleanup_extra_messages(
             )
 
 
+def send_page_messages(
+    chat_id: int,
+    search_id: str,
+    results: List[str],
+    total_results: int,
+    current_page: int,
+    total_pages: int,
+    reply_to_message_id: Optional[int] = None
+) -> Dict[str, Any]:
+    """
+    Envoie une page en un ou plusieurs messages Telegram.
+
+    Règle essentielle : le bouton « ➡️ Suivant » est placé uniquement sur
+    le DERNIER message de la page. Il ne peut donc plus apparaître au milieu
+    d'un résultat [N].
+    """
+
+    chunks = build_page_message_chunks(
+        results=results,
+        total_results=total_results,
+        current_page=current_page,
+        total_pages=total_pages
+    )
+
+    markup = build_pagination_markup(
+        chat_id,
+        search_id,
+        current_page,
+        total_pages
+    )
+
+    message_ids: List[int] = []
+
+    for index, chunk in enumerate(chunks):
+
+        is_last = index == len(chunks) - 1
+        message_markup = markup if is_last else None
+
+        # Le message temporaire de recherche est utilisé comme réponse
+        # uniquement pour le premier message de la page.
+        reply_id = (
+            reply_to_message_id
+            if index == 0 and reply_to_message_id
+            else None
+        )
+
+        msg = bot.send_message(
+            chat_id,
+            chunk,
+            reply_markup=message_markup,
+            reply_to_message_id=reply_id
+        )
+
+        message_ids.append(msg.message_id)
+
+    main_message_id = message_ids[-1]
+    extra_message_ids = message_ids[:-1]
+
+    logger.info(
+        f"📄 Page {current_page}/{total_pages} envoyée en "
+        f"{len(message_ids)} message(s) - bouton sur le dernier message"
+    )
+
+    return {
+        "main_message_id": main_message_id,
+        "extra_message_ids": extra_message_ids
+    }
+
+
 def send_paginated_message(
     chat_id: int,
     search_id: str,
@@ -782,11 +911,10 @@ def send_paginated_message(
     reply_to_message_id: Optional[int] = None
 ) -> Dict[str, Any]:
     """
-    Envoie un message avec pagination.
+    Envoie une page paginée en respectant les blocs [N].
 
-    Retourne:
-    - main_message_id
-    - extra_message_ids
+    Le nom de cette fonction est conservé pour ne rien casser dans le reste
+    du programme.
     """
 
     page_results = get_page_results(
@@ -794,74 +922,15 @@ def send_paginated_message(
         current_page
     )
 
-    formatted_text = format_page_results(
-        page_results,
-        len(results),
-        current_page,
-        total_pages
+    return send_page_messages(
+        chat_id=chat_id,
+        search_id=search_id,
+        results=page_results,
+        total_results=len(results),
+        current_page=current_page,
+        total_pages=total_pages,
+        reply_to_message_id=reply_to_message_id
     )
-
-    extra_message_ids = []
-    main_message_id = None
-
-    markup = build_pagination_markup(
-        chat_id,
-        search_id,
-        current_page,
-        total_pages
-    )
-
-    if len(formatted_text) > 4000:
-
-        chunks = split_text_into_chunks(
-            formatted_text,
-            4000
-        )
-
-        msg = bot.send_message(
-            chat_id,
-            chunks[0],
-            reply_markup=markup,
-            reply_to_message_id=(
-                reply_to_message_id
-                if reply_to_message_id
-                else None
-            )
-        )
-
-        main_message_id = msg.message_id
-
-        for chunk in chunks[1:]:
-
-            extra_msg = bot.send_message(
-                chat_id,
-                chunk
-            )
-
-            extra_message_ids.append(
-                extra_msg.message_id
-            )
-
-    else:
-
-        msg = bot.send_message(
-            chat_id,
-            formatted_text,
-            reply_markup=markup,
-            reply_to_message_id=(
-                reply_to_message_id
-                if reply_to_message_id
-                else None
-            )
-        )
-
-        main_message_id = msg.message_id
-
-    return {
-        "main_message_id": main_message_id,
-        "extra_message_ids": extra_message_ids
-    }
-
 
 def build_pagination_markup(
     chat_id: int,
@@ -1980,66 +2049,39 @@ def callback_handler(call):
         # IMPORTANT : la page précédente n'est PAS modifiée et n'est PAS supprimée.
         # Chaque clic sur « ➡️ Suivant » génère une nouvelle page sous forme
         # de nouveaux messages Telegram.
+        #
+        # Protection contre les doubles clics : le seul bouton valide est
+        # celui qui demande exactement la page suivante de l'état courant.
+        current_state_page = int(state.get("page", 1))
+
+        if target_page != current_state_page + 1:
+            bot.answer_callback_query(
+                call.id,
+                "⚠️ Cette page a déjà été chargée ou n'est plus valide."
+            )
+            return
+
         page_results = get_page_results(
             results,
             target_page
         )
 
-        formatted_text = format_page_results(
-            page_results,
-            len(results),
-            target_page,
-            total_pages
+        page_message_result = send_page_messages(
+            chat_id=chat_id,
+            search_id=search_id,
+            results=page_results,
+            total_results=len(results),
+            current_page=target_page,
+            total_pages=total_pages
         )
-
-        markup = build_pagination_markup(
-            chat_id,
-            search_id,
-            target_page,
-            total_pages
-        )
-
-        if len(formatted_text) <= 4000:
-
-            new_msg = bot.send_message(
-                chat_id,
-                formatted_text,
-                reply_markup=markup
-            )
-
-            new_main_message_id = new_msg.message_id
-            new_extra_message_ids = []
-
-        else:
-
-            chunks = split_text_into_chunks(
-                formatted_text,
-                4000
-            )
-
-            first_msg = bot.send_message(
-                chat_id,
-                chunks[0],
-                reply_markup=markup
-            )
-
-            new_main_message_id = first_msg.message_id
-            new_extra_message_ids = []
-
-            for chunk in chunks[1:]:
-
-                extra_msg = bot.send_message(
-                    chat_id,
-                    chunk
-                )
-
-                new_extra_message_ids.append(
-                    extra_msg.message_id
-                )
 
         state["page"] = target_page
-        state["main_message_id"] = new_main_message_id
-        state["extra_message_ids"] = new_extra_message_ids
+        state["main_message_id"] = page_message_result[
+            "main_message_id"
+        ]
+        state["extra_message_ids"] = page_message_result[
+            "extra_message_ids"
+        ]
         state["timestamp"] = time.time()
 
         bot.answer_callback_query(
