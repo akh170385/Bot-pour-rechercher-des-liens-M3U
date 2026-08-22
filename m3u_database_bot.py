@@ -666,11 +666,8 @@ def split_text_into_chunks(
     max_length: int = 4000
 ) -> List[str]:
     """
-    Découpe un texte long sans dépasser la limite Telegram.
-
-    Cette fonction reste disponible comme utilitaire générique. La
-    pagination des résultats utilise désormais build_page_message_chunks(),
-    qui évite de couper un résultat [N] lorsqu'il tient dans un message.
+    Divise un texte en plusieurs morceaux
+    sans couper les lignes.
     """
 
     if len(text) <= max_length:
@@ -688,24 +685,36 @@ def split_text_into_chunks(
                 chunks.append(current_chunk)
                 current_chunk = ""
 
-            # Cas exceptionnel : une ligne seule dépasse la limite Telegram.
-            step = max(1, max_length - 100)
-            for i in range(0, len(line), step):
-                chunks.append(line[i:i + step])
+            for i in range(
+                0,
+                len(line),
+                max_length - 100
+            ):
+                chunks.append(
+                    line[
+                        i:i + max_length - 100
+                    ]
+                )
 
             continue
 
-        candidate = (
-            f"{current_chunk}\n{line}"
-            if current_chunk
-            else line
-        )
+        if (
+            len(current_chunk)
+            + len(line)
+            + 1
+            <= max_length
+        ):
 
-        if len(candidate) <= max_length:
-            current_chunk = candidate
+            if current_chunk:
+                current_chunk += "\n" + line
+            else:
+                current_chunk = line
+
         else:
+
             if current_chunk:
                 chunks.append(current_chunk)
+
             current_chunk = line
 
     if current_chunk:
@@ -720,7 +729,7 @@ def format_page_results(
     current_page: int,
     total_pages: int
 ) -> str:
-    """Formate une page complète de résultats."""
+    """Formate les résultats d'une page."""
 
     result_text = (
         f"✅ {total_results} résultat(s) trouvé(s)\n"
@@ -741,75 +750,6 @@ def format_page_results(
         )
 
     return result_text
-
-
-def build_page_message_chunks(
-    results: List[str],
-    total_results: int,
-    current_page: int,
-    total_pages: int,
-    max_length: int = 4000
-) -> List[str]:
-    """
-    Construit les messages Telegram d'une page sans couper les résultats.
-
-    Chaque résultat [N] est traité comme un bloc atomique. Plusieurs
-    résultats sont regroupés dans le même message tant que la limite
-    Telegram est respectée.
-
-    Le bouton « ➡️ Suivant » est ajouté uniquement au dernier message de
-    la page par send_page_messages().
-
-    Si un résultat individuel dépasse la limite Telegram, il est découpé
-    en dernier recours, car Telegram refuse les messages trop longs.
-    Les résultats normaux restent donc entièrement intacts.
-    """
-
-    header = (
-        f"✅ {total_results} résultat(s) trouvé(s)\n"
-        f"📄 Page {current_page} / {total_pages}\n\n"
-    )
-
-    chunks: List[str] = []
-    current_chunk = header
-
-    for i, block in enumerate(results, 1):
-
-        global_idx = (
-            (current_page - 1)
-            * RESULTS_PER_PAGE
-            + i
-        )
-
-        result_block = (
-            f"[{global_idx}]\n"
-            f"{block}\n\n"
-        )
-
-        candidate = current_chunk + result_block
-
-        if len(candidate) <= max_length:
-            current_chunk = candidate
-            continue
-
-        if current_chunk.strip():
-            chunks.append(current_chunk.rstrip())
-
-        # Un résultat individuel normal doit rester entier.
-        if len(result_block) > max_length:
-            oversized_parts = split_text_into_chunks(
-                result_block,
-                max_length
-            )
-            chunks.extend(oversized_parts[:-1])
-            current_chunk = oversized_parts[-1]
-        else:
-            current_chunk = result_block
-
-    if current_chunk.strip():
-        chunks.append(current_chunk.rstrip())
-
-    return chunks or [header.rstrip()]
 
 
 def cleanup_extra_messages(
@@ -833,75 +773,6 @@ def cleanup_extra_messages(
             )
 
 
-def send_page_messages(
-    chat_id: int,
-    search_id: str,
-    results: List[str],
-    total_results: int,
-    current_page: int,
-    total_pages: int,
-    reply_to_message_id: Optional[int] = None
-) -> Dict[str, Any]:
-    """
-    Envoie une page en un ou plusieurs messages Telegram.
-
-    Règle essentielle : le bouton « ➡️ Suivant » est placé uniquement sur
-    le DERNIER message de la page. Il ne peut donc plus apparaître au milieu
-    d'un résultat [N].
-    """
-
-    chunks = build_page_message_chunks(
-        results=results,
-        total_results=total_results,
-        current_page=current_page,
-        total_pages=total_pages
-    )
-
-    markup = build_pagination_markup(
-        chat_id,
-        search_id,
-        current_page,
-        total_pages
-    )
-
-    message_ids: List[int] = []
-
-    for index, chunk in enumerate(chunks):
-
-        is_last = index == len(chunks) - 1
-        message_markup = markup if is_last else None
-
-        # Le message temporaire de recherche est utilisé comme réponse
-        # uniquement pour le premier message de la page.
-        reply_id = (
-            reply_to_message_id
-            if index == 0 and reply_to_message_id
-            else None
-        )
-
-        msg = bot.send_message(
-            chat_id,
-            chunk,
-            reply_markup=message_markup,
-            reply_to_message_id=reply_id
-        )
-
-        message_ids.append(msg.message_id)
-
-    main_message_id = message_ids[-1]
-    extra_message_ids = message_ids[:-1]
-
-    logger.info(
-        f"📄 Page {current_page}/{total_pages} envoyée en "
-        f"{len(message_ids)} message(s) - bouton sur le dernier message"
-    )
-
-    return {
-        "main_message_id": main_message_id,
-        "extra_message_ids": extra_message_ids
-    }
-
-
 def send_paginated_message(
     chat_id: int,
     search_id: str,
@@ -911,10 +782,11 @@ def send_paginated_message(
     reply_to_message_id: Optional[int] = None
 ) -> Dict[str, Any]:
     """
-    Envoie une page paginée en respectant les blocs [N].
+    Envoie un message avec pagination.
 
-    Le nom de cette fonction est conservé pour ne rien casser dans le reste
-    du programme.
+    Retourne:
+    - main_message_id
+    - extra_message_ids
     """
 
     page_results = get_page_results(
@@ -922,15 +794,74 @@ def send_paginated_message(
         current_page
     )
 
-    return send_page_messages(
-        chat_id=chat_id,
-        search_id=search_id,
-        results=page_results,
-        total_results=len(results),
-        current_page=current_page,
-        total_pages=total_pages,
-        reply_to_message_id=reply_to_message_id
+    formatted_text = format_page_results(
+        page_results,
+        len(results),
+        current_page,
+        total_pages
     )
+
+    extra_message_ids = []
+    main_message_id = None
+
+    markup = build_pagination_markup(
+        chat_id,
+        search_id,
+        current_page,
+        total_pages
+    )
+
+    if len(formatted_text) > 4000:
+
+        chunks = split_text_into_chunks(
+            formatted_text,
+            4000
+        )
+
+        msg = bot.send_message(
+            chat_id,
+            chunks[0],
+            reply_markup=markup,
+            reply_to_message_id=(
+                reply_to_message_id
+                if reply_to_message_id
+                else None
+            )
+        )
+
+        main_message_id = msg.message_id
+
+        for chunk in chunks[1:]:
+
+            extra_msg = bot.send_message(
+                chat_id,
+                chunk
+            )
+
+            extra_message_ids.append(
+                extra_msg.message_id
+            )
+
+    else:
+
+        msg = bot.send_message(
+            chat_id,
+            formatted_text,
+            reply_markup=markup,
+            reply_to_message_id=(
+                reply_to_message_id
+                if reply_to_message_id
+                else None
+            )
+        )
+
+        main_message_id = msg.message_id
+
+    return {
+        "main_message_id": main_message_id,
+        "extra_message_ids": extra_message_ids
+    }
+
 
 def build_pagination_markup(
     chat_id: int,
@@ -938,32 +869,92 @@ def build_pagination_markup(
     current_page: int,
     total_pages: int
 ):
-    """Construit le clavier inline de pagination.
-
-    - S'il existe une page suivante : affiche uniquement « ➡️ Suivant ».
-    - Sur la dernière page : aucun bouton n'est affiché.
-    - Aucun bouton « Précédent », « Début » ou « Fin ».
-    """
+    """Construit le clavier inline pour la pagination."""
 
     from telebot.types import (
         InlineKeyboardMarkup,
         InlineKeyboardButton
     )
 
-    if current_page >= total_pages:
-        return None
+    markup = InlineKeyboardMarkup(
+        row_width=2
+    )
 
-    markup = InlineKeyboardMarkup(row_width=1)
+    buttons = []
 
-    markup.add(
-        InlineKeyboardButton(
-            "➡️ Suivant",
-            callback_data=(
-                f"page_{search_id}_"
-                f"{current_page + 1}"
+    if current_page > 1:
+
+        buttons.append(
+            InlineKeyboardButton(
+                "⬅️ Précédent",
+                callback_data=(
+                    f"page_{search_id}_"
+                    f"{current_page - 1}"
+                )
             )
         )
-    )
+
+    else:
+
+        buttons.append(
+            InlineKeyboardButton(
+                "⬅️ Précédent",
+                callback_data="disabled"
+            )
+        )
+
+    if current_page < total_pages:
+
+        buttons.append(
+            InlineKeyboardButton(
+                "➡️ Suivant",
+                callback_data=(
+                    f"page_{search_id}_"
+                    f"{current_page + 1}"
+                )
+            )
+        )
+
+    else:
+
+        buttons.append(
+            InlineKeyboardButton(
+                "➡️ Suivant",
+                callback_data="disabled"
+            )
+        )
+
+    markup.row(*buttons)
+
+    if total_pages > 2:
+
+        nav_buttons = []
+
+        if current_page > 2:
+
+            nav_buttons.append(
+                InlineKeyboardButton(
+                    "⏮️ Début",
+                    callback_data=(
+                        f"page_{search_id}_1"
+                    )
+                )
+            )
+
+        if current_page < total_pages - 1:
+
+            nav_buttons.append(
+                InlineKeyboardButton(
+                    "⏭️ Fin",
+                    callback_data=(
+                        f"page_{search_id}_"
+                        f"{total_pages}"
+                    )
+                )
+            )
+
+        if nav_buttons:
+            markup.row(*nav_buttons)
 
     return markup
 
@@ -1983,131 +1974,238 @@ def callback_handler(call):
 
             return
 
-        if not call.data.startswith("page_"):
+        if call.data.startswith("page_"):
+
+            # Le search_id contient désormais "|".
+            # split("_", 2) garantit exactement
+            # trois parties maximum:
+            #
+            # ["page", "chat_id|timestamp", "page"]
+            #
+            # Exemple:
+            # page_123456789|1723456789_2
+
+            parts = call.data.split("_", 2)
+
+            if len(parts) == 3:
+
+                search_id = parts[1]
+                page_str = parts[2]
+
+                try:
+
+                    target_page = int(page_str)
+
+                    cleanup_expired_states()
+
+                    state = pagination_state.get(
+                        search_id
+                    )
+
+                    if state is None:
+
+                        bot.answer_callback_query(
+                            call.id,
+                            "⚠️ Recherche expirée "
+                            "ou inexistante. "
+                            "Relancez la recherche."
+                        )
+
+                        return
+
+                    chat_id = state["chat_id"]
+
+                    if (
+                        chat_id
+                        != call.message.chat.id
+                    ):
+
+                        bot.answer_callback_query(
+                            call.id,
+                            "⚠️ Cette recherche "
+                            "n'est pas dans ce chat."
+                        )
+
+                        return
+
+                    results = state["results"]
+                    total_pages = state["total_pages"]
+
+                    if (
+                        target_page < 1
+                        or
+                        target_page > total_pages
+                    ):
+
+                        bot.answer_callback_query(
+                            call.id,
+                            "❌ Page invalide"
+                        )
+
+                        return
+
+                    if "extra_message_ids" in state:
+
+                        cleanup_extra_messages(
+                            chat_id,
+                            state[
+                                "extra_message_ids"
+                            ]
+                        )
+
+                        state[
+                            "extra_message_ids"
+                        ] = []
+
+                    state["page"] = target_page
+
+                    page_results = get_page_results(
+                        results,
+                        target_page
+                    )
+
+                    formatted_text = (
+                        format_page_results(
+                            page_results,
+                            len(results),
+                            target_page,
+                            total_pages
+                        )
+                    )
+
+                    markup = build_pagination_markup(
+                        chat_id,
+                        search_id,
+                        target_page,
+                        total_pages
+                    )
+
+                    if len(formatted_text) > 4000:
+
+                        chunks = split_text_into_chunks(
+                            formatted_text,
+                            4000
+                        )
+
+                        try:
+
+                            bot.edit_message_text(
+                                chunks[0],
+                                call.message.chat.id,
+                                call.message.message_id,
+                                reply_markup=markup
+                            )
+
+                        except Exception as e:
+
+                            logger.warning(
+                                "⚠️ Erreur lors de "
+                                f"l'édition du message : {e}"
+                            )
+
+                            new_msg = bot.send_message(
+                                call.message.chat.id,
+                                chunks[0],
+                                reply_markup=markup
+                            )
+
+                            state[
+                                "main_message_id"
+                            ] = new_msg.message_id
+
+                            try:
+
+                                bot.delete_message(
+                                    call.message.chat.id,
+                                    call.message.message_id
+                                )
+
+                            except Exception:
+                                pass
+
+                        extra_ids = []
+
+                        for chunk in chunks[1:]:
+
+                            extra_msg = bot.send_message(
+                                call.message.chat.id,
+                                chunk
+                            )
+
+                            extra_ids.append(
+                                extra_msg.message_id
+                            )
+
+                        state[
+                            "extra_message_ids"
+                        ] = extra_ids
+
+                    else:
+
+                        try:
+
+                            bot.edit_message_text(
+                                formatted_text,
+                                call.message.chat.id,
+                                call.message.message_id,
+                                reply_markup=markup
+                            )
+
+                        except Exception as e:
+
+                            logger.warning(
+                                "⚠️ Erreur lors de "
+                                f"l'édition du message : {e}"
+                            )
+
+                            new_msg = bot.send_message(
+                                call.message.chat.id,
+                                formatted_text,
+                                reply_markup=markup
+                            )
+
+                            state[
+                                "main_message_id"
+                            ] = new_msg.message_id
+
+                            try:
+
+                                bot.delete_message(
+                                    call.message.chat.id,
+                                    call.message.message_id
+                                )
+
+                            except Exception:
+                                pass
+
+                    bot.answer_callback_query(
+                        call.id
+                    )
+
+                except ValueError:
+
+                    bot.answer_callback_query(
+                        call.id,
+                        "❌ Erreur de pagination"
+                    )
+
+            else:
+
+                bot.answer_callback_query(
+                    call.id,
+                    "❌ Format de pagination invalide"
+                )
+
+        else:
 
             bot.answer_callback_query(
                 call.id
             )
 
-            return
-
-        # Le search_id contient « | ».
-        # split("_", 2) garantit exactement trois parties maximum.
-        parts = call.data.split("_", 2)
-
-        if len(parts) != 3:
-
-            bot.answer_callback_query(
-                call.id,
-                "❌ Format de pagination invalide"
-            )
-
-            return
-
-        search_id = parts[1]
-        target_page = int(parts[2])
-
-        cleanup_expired_states()
-
-        state = pagination_state.get(search_id)
-
-        if state is None:
-
-            bot.answer_callback_query(
-                call.id,
-                "⚠️ Recherche expirée ou inexistante. Relancez la recherche."
-            )
-
-            return
-
-        chat_id = state.get("chat_id")
-
-        if chat_id != call.message.chat.id:
-
-            bot.answer_callback_query(
-                call.id,
-                "⚠️ Cette recherche n'est pas dans ce chat."
-            )
-
-            return
-
-        results = state.get("results", [])
-        total_pages = int(state.get("total_pages", 1))
-
-        if (
-            target_page < 1
-            or target_page > total_pages
-        ):
-
-            bot.answer_callback_query(
-                call.id,
-                "❌ Page invalide"
-            )
-
-            return
-
-        # IMPORTANT : la page précédente n'est PAS modifiée et n'est PAS supprimée.
-        # Chaque clic sur « ➡️ Suivant » génère une nouvelle page sous forme
-        # de nouveaux messages Telegram.
-        #
-        # Protection contre les doubles clics : le seul bouton valide est
-        # celui qui demande exactement la page suivante de l'état courant.
-        current_state_page = int(state.get("page", 1))
-
-        if target_page != current_state_page + 1:
-            bot.answer_callback_query(
-                call.id,
-                "⚠️ Cette page a déjà été chargée ou n'est plus valide."
-            )
-            return
-
-        page_results = get_page_results(
-            results,
-            target_page
-        )
-
-        page_message_result = send_page_messages(
-            chat_id=chat_id,
-            search_id=search_id,
-            results=page_results,
-            total_results=len(results),
-            current_page=target_page,
-            total_pages=total_pages
-        )
-
-        state["page"] = target_page
-        state["main_message_id"] = page_message_result[
-            "main_message_id"
-        ]
-        state["extra_message_ids"] = page_message_result[
-            "extra_message_ids"
-        ]
-        state["timestamp"] = time.time()
-
-        bot.answer_callback_query(
-            call.id
-        )
-
-    except (ValueError, KeyError) as e:
-
-        logger.warning(
-            f"⚠️ Erreur pagination : {e}"
-        )
-
-        try:
-
-            bot.answer_callback_query(
-                call.id,
-                "❌ Erreur de pagination"
-            )
-
-        except Exception:
-            pass
-
     except Exception as e:
 
-        logger.exception(
-            f"❌ Erreur callback : {e}"
+        logger.warning(
+            f"⚠️ Erreur callback : {e}"
         )
 
         try:
