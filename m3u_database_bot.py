@@ -1523,9 +1523,6 @@ Recherche des liens M3U (accessible à tous)
 📊 /stats
 Affiche les statistiques.
 
-💾 /save
-Sauvegarde manuelle (admin).
-
 🧱 /reindex
 Reconstruit l'index de recherche rapide (admin).
 
@@ -1574,8 +1571,6 @@ def help_handler(message):
 🔍 /m3u http://serveur.com:8080
 
 📊 /stats (authentification requise)
-
-💾 /save (authentification requise)
 
 🧱 /reindex (authentification requise, admin)
 
@@ -1862,90 +1857,6 @@ def stats_handler(message):
         logger.exception(
             f"❌ Erreur /stats : {e}"
         )
-
-
-# ============================================================
-# /SAVE - PROTÉGÉ PAR AUTHENTIFICATION ET ADMIN_IDS
-# ============================================================
-
-@bot.message_handler(commands=["save"])
-def save_handler(message):
-
-    logger.info(
-        f"📩 /save reçu de user_id="
-        f"{message.from_user.id}"
-    )
-
-    user_id = message.from_user.id
-    chat_type = message.chat.type
-
-    if chat_type == "private":
-
-        if not is_user_authenticated(user_id):
-
-            bot.reply_to(
-                message,
-                "🔐 Accès protégé.\n\n"
-                "Veuillez vous authentifier en envoyant "
-                "le mot de passe en message privé."
-            )
-
-            return
-
-    else:
-
-        bot.reply_to(
-            message,
-            "🔐 Cette commande est réservée aux "
-            "utilisateurs authentifiés.\n\n"
-            "Veuillez utiliser cette commande en "
-            "conversation privée avec le bot."
-        )
-
-        return
-
-    try:
-
-        if not is_admin(user_id):
-
-            bot.reply_to(
-                message,
-                "❌ Permission refusée. "
-                "Vous n'êtes pas administrateur."
-            )
-
-            return
-
-        if supabase:
-
-            bot.reply_to(
-                message,
-                "✅ Les données sont déjà stockées "
-                "dans Supabase."
-            )
-
-        else:
-
-            bot.reply_to(
-                message,
-                "❌ Supabase n'est pas configuré."
-            )
-
-    except Exception as e:
-
-        logger.exception(
-            f"❌ Erreur /save : {e}"
-        )
-
-        try:
-
-            bot.reply_to(
-                message,
-                f"❌ Erreur : {e}"
-            )
-
-        except Exception:
-            pass
 
 
 # ============================================================
@@ -2308,7 +2219,7 @@ def private_message_handler(message):
                 "Vous pouvez maintenant utiliser "
                 "les commandes privées :\n"
                 "/stats\n"
-                "/save\n"
+                "/reindex\n"
                 "Envoi de fichiers .txt"
             )
 
