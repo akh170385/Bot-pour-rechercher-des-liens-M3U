@@ -505,6 +505,54 @@ def reindex_all_files() -> Dict[str, int]:
     }
 
 
+STATS_RPC_FUNCTION = "count_m3u_stats"
+
+_rpc_stats_available = True
+
+
+def get_stats_via_rpc() -> Optional[Dict[str, int]]:
+    """
+    Calcule le nombre de fichiers et de liens directement via une
+    fonction SQL côté Supabase, sans rapatrier le contenu de tous
+    les fichiers en Python.
+
+    Retourne None si le RPC n'est pas disponible (migration non
+    appliquée), pour que l'appelant sache qu'il doit basculer sur
+    l'ancienne méthode — jamais d'exception qui remonte.
+    """
+    global _rpc_stats_available
+
+    if not supabase or not _rpc_stats_available:
+        return None
+
+    try:
+        response = supabase.rpc(
+            STATS_RPC_FUNCTION,
+            {}
+        ).execute()
+
+        if not response.data:
+            return None
+
+        row = response.data[0]
+
+        return {
+            "total_files": row.get("total_files", 0),
+            "total_links": row.get("total_links", 0)
+        }
+
+    except Exception as e:
+        logger.warning(
+            "⚠️ Calcul des stats via RPC Supabase indisponible "
+            "(migration SQL probablement non appliquée) — "
+            f"repli sur l'ancienne méthode. Détail : {e}"
+        )
+
+        _rpc_stats_available = False
+
+        return None
+
+
 # ============================================================
 # AUTHENTIFICATION SYSTEM
 # ============================================================
@@ -1776,13 +1824,25 @@ def stats_handler(message):
 
     try:
 
-        files = get_all_files_from_supabase()
+        # 1) Chemin rapide : calcul SQL côté Supabase, sans
+        # rapatrier le contenu de tous les fichiers en Python.
+        stats = get_stats_via_rpc()
 
-        total_files = len(files)
+        if stats is not None:
+            total_files = stats["total_files"]
+            total_links = stats["total_links"]
 
-        total_links = len(
-            get_all_links_from_supabase()
-        )
+        else:
+            # 2) Repli legacy : rapatrie et reparse tout le
+            # contenu en Python. Toujours fonctionnel même sans
+            # migration SQL.
+            files = get_all_files_from_supabase()
+
+            total_files = len(files)
+
+            total_links = len(
+                get_all_links_from_supabase()
+            )
 
         stats_text = (
             "📊 Statistiques\n\n"
