@@ -363,19 +363,42 @@ def split_file_into_blocks(file_content: str) -> List[str]:
     garantir un comportement de recherche identique une fois
     indexé en base.
     """
+    return list(iter_blocks(file_content))
+
+
+def iter_blocks(file_content: str):
+    """
+    Version "flux" du découpage en blocs : les fournit un par un
+    (générateur) au lieu de construire toute la liste en mémoire
+    d'un coup. Utilisée pour traiter les gros fichiers par petits
+    paquets (voir process_upload_in_chunks) sans jamais dupliquer
+    tout le contenu du fichier dans une deuxième liste complète.
+    """
     if not file_content:
-        return []
+        return
 
-    blocks = re.split(
-        re.escape(BLOCK_SEPARATOR),
-        file_content
-    )
+    start = 0
+    sep_len = len(BLOCK_SEPARATOR)
 
-    return [
-        block.strip()
-        for block in blocks
-        if block.strip()
-    ]
+    while True:
+
+        idx = file_content.find(BLOCK_SEPARATOR, start)
+
+        if idx == -1:
+
+            block = file_content[start:].strip()
+
+            if block:
+                yield block
+
+            break
+
+        block = file_content[start:idx].strip()
+
+        if block:
+            yield block
+
+        start = idx + sep_len
 
 
 def index_blocks_for_file(
@@ -397,10 +420,7 @@ def index_blocks_for_file(
     if not supabase:
         return False
 
-    blocks = split_file_into_blocks(file_content)
-
-    if not blocks:
-        return True
+    blocks_iter = iter_blocks(file_content)
 
     try:
         # Supprime les blocs existants de ce fichier avant de les
@@ -409,27 +429,45 @@ def index_blocks_for_file(
             "filename", filename
         ).execute()
 
-        rows = [
-            {
+        # Construction ET envoi du lot suivant au fur et à mesure,
+        # au lieu de construire toute la liste "rows" pour
+        # l'ensemble du fichier avant de commencer l'envoi — évite
+        # de dupliquer une deuxième fois tout le contenu du fichier
+        # en mémoire (chaque ligne stocke le bloc 3 fois :
+        # block_content, block_normalized, dedup_signature).
+        batch_size = 500
+        total_inserted = 0
+        batch: List[Dict[str, str]] = []
+
+        def flush_insert_batch(rows_batch: List[Dict[str, str]]) -> None:
+            if rows_batch:
+                supabase.table(BLOCKS_TABLE).insert(
+                    rows_batch
+                ).execute()
+
+        for block in blocks_iter:
+
+            batch.append({
                 "filename": filename,
                 "block_content": block,
                 "block_normalized": normalize_server(block),
                 "dedup_signature": normalize_block_for_dedup(block)
-            }
-            for block in blocks
-        ]
+            })
 
-        # Insertion par lots pour rester sous les limites de taille
-        # de requête de Supabase/PostgREST sur les gros fichiers.
-        batch_size = 500
+            if len(batch) >= batch_size:
+                flush_insert_batch(batch)
+                total_inserted += len(batch)
+                batch = []
 
-        for i in range(0, len(rows), batch_size):
-            batch = rows[i:i + batch_size]
-            supabase.table(BLOCKS_TABLE).insert(batch).execute()
+        flush_insert_batch(batch)
+        total_inserted += len(batch)
+
+        if total_inserted == 0:
+            return True
 
         logger.info(
             f"🧱 Indexation terminée pour {filename} : "
-            f"{len(rows)} bloc(s)"
+            f"{total_inserted} bloc(s)"
         )
 
         return True
@@ -695,64 +733,6 @@ def filter_new_signatures_via_rpc(
         _rpc_dedup_available = False
 
         return None
-
-
-def filter_new_blocks_smart(blocks: List[str]) -> Dict[str, Any]:
-    """
-    Version "intelligente" de filter_new_blocks : essaie d'abord le
-    chemin rapide SQL (filter_new_signatures_via_rpc), et ne
-    retombe sur le rapatriement complet (get_existing_block_signatures
-    + filter_new_blocks) que si la migration SQL n'est pas encore
-    appliquée. Le comportement final est identique dans les deux cas.
-    """
-    # Dédoublonnage à l'intérieur même du fichier uploadé, en
-    # gardant le premier exemplaire de chaque bloc rencontré.
-    unique_blocks: List[str] = []
-    seen_in_upload: Set[str] = set()
-    duplicates_within_upload = 0
-
-    for block in blocks:
-        signature = normalize_block_for_dedup(block)
-
-        if signature in seen_in_upload:
-            duplicates_within_upload += 1
-            continue
-
-        seen_in_upload.add(signature)
-        unique_blocks.append(block)
-
-    if not unique_blocks:
-        return {"kept": [], "duplicates_count": duplicates_within_upload}
-
-    signatures = [
-        normalize_block_for_dedup(block) for block in unique_blocks
-    ]
-
-    new_signatures = filter_new_signatures_via_rpc(signatures)
-
-    if new_signatures is not None:
-
-        kept = [
-            block
-            for block, sig in zip(unique_blocks, signatures)
-            if sig in new_signatures
-        ]
-
-        duplicates_count = (
-            duplicates_within_upload
-            + (len(unique_blocks) - len(kept))
-        )
-
-        return {"kept": kept, "duplicates_count": duplicates_count}
-
-    # Repli legacy : rapatrie tout et compare en Python.
-    existing_signatures = get_existing_block_signatures()
-
-    resultat = filter_new_blocks(unique_blocks, existing_signatures)
-
-    resultat["duplicates_count"] += duplicates_within_upload
-
-    return resultat
 
 
 # ============================================================
@@ -2652,6 +2632,179 @@ def verifierbase_handler(message):
 
 
 # ============================================================
+# TRAITEMENT D'UPLOAD PAR PETITS PAQUETS (ANTI-OOM)
+# ============================================================
+# Suite à un plantage constaté sur un fichier de 15 Mo (le
+# processus dépassait la RAM disponible sur Render et mourait
+# silencieusement en plein traitement), l'upload est désormais
+# traité PAR PAQUETS de UPLOAD_CHUNK_SIZE blocs : dédoublonnage,
+# vérification des liens et accumulation des résultats se font au
+# fur et à mesure, sans jamais garder tout le fichier découpé en
+# mémoire d'un coup. Rien à changer côté utilisateur — un seul
+# envoi suffit, même pour un gros fichier.
+
+UPLOAD_CHUNK_SIZE = 300
+
+
+def process_upload_in_chunks(file_content: str) -> Dict[str, Any]:
+    """
+    Traite un fichier uploadé par petits paquets plutôt que tout
+    garder en mémoire d'un coup.
+
+    Pour chaque paquet de UPLOAD_CHUNK_SIZE blocs, dans l'ordre :
+      1. Dédoublonnage (dans le paquet + contre ce qui a déjà été
+         vu plus tôt dans CE fichier + contre la base, via RPC).
+      2. Vérification de validité des liens du paquet (tant que le
+         plafond global MAX_LINKS_CHECK_UPLOAD n'est pas atteint).
+      3. Les blocs survivants du paquet sont ajoutés au résultat
+         final ; le reste du paquet est ensuite oublié (libéré de
+         la mémoire) avant de passer au paquet suivant.
+
+    Retourne un dict avec "kept_blocks", "duplicates_count",
+    "dead_count" et "verification_desactivee".
+    """
+    seen_signatures: Set[str] = set()
+    kept_blocks: List[str] = []
+
+    duplicates_count = 0
+    dead_count = 0
+    links_tested_so_far = 0
+    verification_desactivee = False
+
+    # Repli legacy : si le RPC de dédoublonnage n'est pas
+    # disponible, on rapatrie les signatures existantes UNE SEULE
+    # FOIS pour tout le fichier (pas à chaque paquet), pour ne pas
+    # refaire ce travail lourd des dizaines de fois de suite.
+    legacy_existing_signatures: Optional[Set[str]] = None
+
+    def flush_chunk(chunk_blocks: List[str]) -> None:
+
+        nonlocal duplicates_count, dead_count
+        nonlocal verification_desactivee, links_tested_so_far
+        nonlocal legacy_existing_signatures
+
+        if not chunk_blocks:
+            return
+
+        # --- Dédoublonnage ---
+        chunk_unique_blocks: List[str] = []
+        chunk_unique_sigs: List[str] = []
+
+        for block in chunk_blocks:
+
+            sig = normalize_block_for_dedup(block)
+
+            if sig in seen_signatures:
+                duplicates_count += 1
+                continue
+
+            seen_signatures.add(sig)
+            chunk_unique_blocks.append(block)
+            chunk_unique_sigs.append(sig)
+
+        if not chunk_unique_blocks:
+            return
+
+        new_sigs = filter_new_signatures_via_rpc(chunk_unique_sigs)
+
+        if new_sigs is None:
+
+            if legacy_existing_signatures is None:
+                legacy_existing_signatures = (
+                    get_existing_block_signatures()
+                )
+
+            new_sigs = {
+                sig for sig in chunk_unique_sigs
+                if sig not in legacy_existing_signatures
+            }
+
+            legacy_existing_signatures |= set(chunk_unique_sigs)
+
+        chunk_new_blocks = [
+            block
+            for block, sig in zip(
+                chunk_unique_blocks, chunk_unique_sigs
+            )
+            if sig in new_sigs
+        ]
+
+        duplicates_count += (
+            len(chunk_unique_blocks) - len(chunk_new_blocks)
+        )
+
+        if not chunk_new_blocks:
+            return
+
+        # --- Vérification de validité (si sous le plafond) ---
+        if REQUESTS_AVAILABLE and not verification_desactivee:
+
+            url_par_bloc = {}
+            urls_a_tester = []
+
+            for block in chunk_new_blocks:
+                url = extract_first_url(block)
+                if url:
+                    url_par_bloc[block] = url
+                    if url not in urls_a_tester:
+                        urls_a_tester.append(url)
+
+            if (
+                links_tested_so_far + len(urls_a_tester)
+                > MAX_LINKS_CHECK_UPLOAD
+            ):
+
+                verification_desactivee = True
+
+            elif urls_a_tester:
+
+                links_tested_so_far += len(urls_a_tester)
+
+                statut = check_urls_status(
+                    urls_a_tester,
+                    max_workers=BULK_CHECK_MAX_WORKERS,
+                    batch_size=BULK_CHECK_BATCH_SIZE,
+                    batch_pause_seconds=(
+                        BULK_CHECK_BATCH_PAUSE_SECONDS
+                    )
+                )
+
+                for block in chunk_new_blocks:
+
+                    url = url_par_bloc.get(block)
+
+                    if url and statut.get(url) is False:
+                        dead_count += 1
+                    else:
+                        kept_blocks.append(block)
+
+                return
+
+        # Vérification désactivée (plafond atteint) ou aucun lien
+        # détecté dans ce paquet : on garde les blocs tels quels.
+        kept_blocks.extend(chunk_new_blocks)
+
+    chunk: List[str] = []
+
+    for block in iter_blocks(file_content):
+
+        chunk.append(block)
+
+        if len(chunk) >= UPLOAD_CHUNK_SIZE:
+            flush_chunk(chunk)
+            chunk = []
+
+    flush_chunk(chunk)
+
+    return {
+        "kept_blocks": kept_blocks,
+        "duplicates_count": duplicates_count,
+        "dead_count": dead_count,
+        "verification_desactivee": verification_desactivee
+    }
+
+
+# ============================================================
 # RÉCEPTION DES FICHIERS TXT
 # ============================================================
 
@@ -2772,68 +2925,18 @@ def document_handler(message):
             errors="ignore"
         )
 
-        # --- Dédoublonnage à l'upload ---
-        # On découpe le fichier reçu en blocs, puis on ne garde que
-        # les blocs réellement nouveaux (ni déjà présents ailleurs,
-        # ni répétés dans ce même fichier). filter_new_blocks_smart
-        # essaie d'abord le calcul rapide côté Supabase (comme pour
-        # /m3u et /stats), et ne rapatrie tout que si la migration
-        # SQL n'a pas encore été appliquée.
-        blocks_uploades = split_file_into_blocks(file_content_brut)
+        # --- Traitement par petits paquets (anti-OOM) ---
+        # Dédoublonnage + vérification des liens morts, effectués
+        # UPLOAD_CHUNK_SIZE blocs à la fois plutôt que tout garder
+        # en mémoire d'un coup. Voir process_upload_in_chunks pour
+        # le détail — nécessaire depuis le plantage constaté sur un
+        # fichier de 15 Mo.
+        resultat = process_upload_in_chunks(file_content_brut)
 
-        filtre = filter_new_blocks_smart(blocks_uploades)
-
-        blocs_conserves = filtre["kept"]
-        doublons_ignores = filtre["duplicates_count"]
-
-        # --- Vérification des liens morts à l'upload ---
-        # Teste uniquement les blocs déjà dédupliqués (jamais les
-        # doublons qu'on vient de rejeter, inutile de les tester).
-        # Concurrence volontairement faible + traitement par
-        # paquets avec pauses (BULK_CHECK_*), pour ne jamais
-        # surcharger un serveur aux ressources très limitées.
-        # Si le fichier contient trop de liens uniques, la
-        # vérification est désactivée pour cet upload plutôt que
-        # de risquer de bloquer le bot trop longtemps.
-        liens_morts_ignores = 0
-        verification_desactivee = False
-
-        if REQUESTS_AVAILABLE and blocs_conserves:
-
-            url_par_bloc = {}
-            urls_a_tester = []
-
-            for block in blocs_conserves:
-                url = extract_first_url(block)
-                if url:
-                    url_par_bloc[block] = url
-                    if url not in urls_a_tester:
-                        urls_a_tester.append(url)
-
-            if len(urls_a_tester) > MAX_LINKS_CHECK_UPLOAD:
-
-                verification_desactivee = True
-
-            elif urls_a_tester:
-
-                statut_liens = check_urls_status(
-                    urls_a_tester,
-                    max_workers=BULK_CHECK_MAX_WORKERS,
-                    batch_size=BULK_CHECK_BATCH_SIZE,
-                    batch_pause_seconds=BULK_CHECK_BATCH_PAUSE_SECONDS
-                )
-
-                blocs_vivants = []
-
-                for block in blocs_conserves:
-                    url = url_par_bloc.get(block)
-
-                    if url and statut_liens.get(url) is False:
-                        liens_morts_ignores += 1
-                    else:
-                        blocs_vivants.append(block)
-
-                blocs_conserves = blocs_vivants
+        blocs_conserves = resultat["kept_blocks"]
+        doublons_ignores = resultat["duplicates_count"]
+        liens_morts_ignores = resultat["dead_count"]
+        verification_desactivee = resultat["verification_desactivee"]
 
         # On reconstruit le contenu du fichier uniquement à partir
         # des blocs uniques et vivants conservés.
