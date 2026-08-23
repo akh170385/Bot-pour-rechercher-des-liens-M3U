@@ -12,6 +12,16 @@ import telebot
 from flask import Flask, request
 from supabase import create_client, Client
 
+# 'requests' est utilisé uniquement pour la vérification à la demande
+# de la validité des liens (bouton "🔎 Vérifier les liens"). Si le
+# paquet n'est pas installé, cette fonctionnalité se désactive
+# proprement sans faire planter le reste du bot.
+try:
+    import requests
+    REQUESTS_AVAILABLE = True
+except ImportError:
+    REQUESTS_AVAILABLE = False
+
 
 # ============================================================
 # LOGS
@@ -264,8 +274,11 @@ def search_links_in_supabase(server_url: str) -> List[str]:
     rpc_results = search_blocks_via_rpc(server_clean)
 
     if rpc_results is not None:
+        rpc_results = dedupe_blocks(rpc_results)
+
         logger.info(
-            f"🔎 Résultats via index SQL : {len(rpc_results)}"
+            f"🔎 Résultats via index SQL (après dédoublonnage) : "
+            f"{len(rpc_results)}"
         )
         return rpc_results
 
@@ -307,6 +320,8 @@ def search_links_in_supabase(server_url: str) -> List[str]:
                 f"⚠️ Erreur recherche dans fichier "
                 f"{file_data.get('filename')}: {e}"
             )
+
+    found_lines = dedupe_blocks(found_lines)
 
     return found_lines
 
@@ -398,7 +413,8 @@ def index_blocks_for_file(
             {
                 "filename": filename,
                 "block_content": block,
-                "block_normalized": normalize_server(block)
+                "block_normalized": normalize_server(block),
+                "dedup_signature": normalize_block_for_dedup(block)
             }
             for block in blocks
         ]
@@ -503,6 +519,393 @@ def reindex_all_files() -> Dict[str, int]:
         "success": success_count,
         "failed": fail_count
     }
+
+
+# ============================================================
+# DÉDOUBLONNAGE
+# ============================================================
+# Deux mécanismes complémentaires :
+#  1) À L'UPLOAD : avant d'enregistrer un nouveau fichier, on
+#     retire les blocs déjà identiques à un bloc existant ailleurs
+#     dans la base, pour ne plus jamais grossir avec des doublons.
+#  2) À L'AFFICHAGE : juste avant d'envoyer les résultats d'une
+#     recherche, on retire les doublons de la liste retournée —
+#     ceci corrige aussi immédiatement les doublons déjà présents
+#     dans les fichiers uploadés AVANT cette mise à jour.
+
+def normalize_block_for_dedup(block: str) -> str:
+    """
+    Normalise un bloc pour la comparaison de doublons : espaces
+    multiples réduits, casse ignorée. Deux blocs identiques au
+    contenu près (mais avec des espaces différents) sont bien
+    considérés comme le même lien.
+    """
+    lines = [
+        line.strip()
+        for line in block.strip().split("\n")
+        if line.strip()
+    ]
+    return "\n".join(lines).lower()
+
+
+def dedupe_blocks(blocks: List[str]) -> List[str]:
+    """
+    Retire les doublons d'une liste de blocs en conservant l'ordre
+    d'apparition (le premier exemplaire rencontré est gardé).
+    Utilisé juste avant d'afficher les résultats d'une recherche.
+    """
+    seen: Set[str] = set()
+    result: List[str] = []
+
+    for block in blocks:
+        signature = normalize_block_for_dedup(block)
+
+        if signature in seen:
+            continue
+
+        seen.add(signature)
+        result.append(block)
+
+    return result
+
+
+def get_existing_block_signatures() -> Set[str]:
+    """
+    Récupère les signatures (contenu normalisé) de tous les blocs
+    déjà stockés dans la base, pour détecter les doublons lors d'un
+    nouvel upload.
+
+    Chemin rapide : lit directement la table m3u_blocks si elle
+    existe (migration appliquée). Repli : reparse tous les fichiers
+    m3u_files si la table n'existe pas encore. Dans les deux cas,
+    ceci n'est appelé qu'à l'upload d'un nouveau fichier — jamais à
+    chaque recherche.
+    """
+    if not supabase:
+        return set()
+
+    try:
+        response = supabase.table(BLOCKS_TABLE).select(
+            "block_content"
+        ).execute()
+
+        return {
+            normalize_block_for_dedup(row["block_content"])
+            for row in (response.data or [])
+            if row.get("block_content")
+        }
+
+    except Exception as e:
+        logger.warning(
+            "⚠️ Lecture de m3u_blocks impossible pour le "
+            f"dédoublonnage (repli sur reparsing complet) : {e}"
+        )
+
+        signatures: Set[str] = set()
+
+        for file_data in get_all_files_from_supabase():
+            file_content = file_data.get("file_content", "")
+
+            for block in split_file_into_blocks(file_content):
+                signatures.add(normalize_block_for_dedup(block))
+
+        return signatures
+
+
+def filter_new_blocks(
+    blocks: List[str],
+    existing_signatures: Set[str]
+) -> Dict[str, Any]:
+    """
+    Sépare les blocs d'un fichier fraîchement uploadé en deux
+    groupes : ceux qui sont vraiment nouveaux (à conserver) et ceux
+    qui sont des doublons (déjà présents ailleurs, ou répétés
+    plusieurs fois dans le même fichier).
+
+    Retourne un dict avec :
+      - "kept": liste des blocs à garder, dans l'ordre d'origine
+      - "duplicates_count": nombre de blocs ignorés
+    """
+    seen_in_this_file: Set[str] = set(existing_signatures)
+    kept: List[str] = []
+    duplicates_count = 0
+
+    for block in blocks:
+        signature = normalize_block_for_dedup(block)
+
+        if signature in seen_in_this_file:
+            duplicates_count += 1
+            continue
+
+        seen_in_this_file.add(signature)
+        kept.append(block)
+
+    return {
+        "kept": kept,
+        "duplicates_count": duplicates_count
+    }
+
+
+# --- Dédoublonnage déporté vers Supabase (comme /m3u et /stats) ---
+# Au lieu de rapatrier TOUT le contenu existant vers Render pour
+# comparer en Python (get_existing_block_signatures), on envoie
+# uniquement les signatures (courtes chaînes) du fichier uploadé à
+# une fonction SQL, qui répond directement quelles signatures sont
+# déjà connues. Render ne reçoit alors qu'un petit résultat filtré,
+# jamais le contenu complet de la base. Repli automatique sur
+# l'ancienne méthode si la migration SQL n'est pas encore faite.
+
+DEDUP_RPC_FUNCTION = "filter_new_dedup_signatures"
+
+_rpc_dedup_available = True
+
+
+def filter_new_signatures_via_rpc(
+    signatures: List[str]
+) -> Optional[Set[str]]:
+    """
+    Envoie une liste de signatures à la fonction SQL
+    `filter_new_dedup_signatures`, qui renvoie uniquement celles
+    qui n'existent PAS encore dans `m3u_blocks`.
+
+    Retourne None si le RPC n'est pas disponible (migration non
+    appliquée), pour que l'appelant sache qu'il doit basculer sur
+    l'ancienne méthode — jamais d'exception qui remonte.
+    """
+    global _rpc_dedup_available
+
+    if not supabase or not _rpc_dedup_available or not signatures:
+        return None
+
+    try:
+        response = supabase.rpc(
+            DEDUP_RPC_FUNCTION,
+            {"candidate_signatures": signatures}
+        ).execute()
+
+        return set(response.data or [])
+
+    except Exception as e:
+        logger.warning(
+            "⚠️ Dédoublonnage via RPC Supabase indisponible "
+            "(migration SQL probablement non appliquée) — "
+            f"repli sur l'ancienne méthode. Détail : {e}"
+        )
+
+        _rpc_dedup_available = False
+
+        return None
+
+
+def filter_new_blocks_smart(blocks: List[str]) -> Dict[str, Any]:
+    """
+    Version "intelligente" de filter_new_blocks : essaie d'abord le
+    chemin rapide SQL (filter_new_signatures_via_rpc), et ne
+    retombe sur le rapatriement complet (get_existing_block_signatures
+    + filter_new_blocks) que si la migration SQL n'est pas encore
+    appliquée. Le comportement final est identique dans les deux cas.
+    """
+    # Dédoublonnage à l'intérieur même du fichier uploadé, en
+    # gardant le premier exemplaire de chaque bloc rencontré.
+    unique_blocks: List[str] = []
+    seen_in_upload: Set[str] = set()
+    duplicates_within_upload = 0
+
+    for block in blocks:
+        signature = normalize_block_for_dedup(block)
+
+        if signature in seen_in_upload:
+            duplicates_within_upload += 1
+            continue
+
+        seen_in_upload.add(signature)
+        unique_blocks.append(block)
+
+    if not unique_blocks:
+        return {"kept": [], "duplicates_count": duplicates_within_upload}
+
+    signatures = [
+        normalize_block_for_dedup(block) for block in unique_blocks
+    ]
+
+    new_signatures = filter_new_signatures_via_rpc(signatures)
+
+    if new_signatures is not None:
+
+        kept = [
+            block
+            for block, sig in zip(unique_blocks, signatures)
+            if sig in new_signatures
+        ]
+
+        duplicates_count = (
+            duplicates_within_upload
+            + (len(unique_blocks) - len(kept))
+        )
+
+        return {"kept": kept, "duplicates_count": duplicates_count}
+
+    # Repli legacy : rapatrie tout et compare en Python.
+    existing_signatures = get_existing_block_signatures()
+
+    resultat = filter_new_blocks(unique_blocks, existing_signatures)
+
+    resultat["duplicates_count"] += duplicates_within_upload
+
+    return resultat
+
+
+# ============================================================
+# VÉRIFICATION DE LA VALIDITÉ DES LIENS (À LA DEMANDE)
+# ============================================================
+# Teste uniquement les liens d'UNE page de résultats affichée
+# (10 liens maximum), jamais toute la base d'un coup — pour rester
+# rapide et ne jamais bloquer le bot. Déclenché par le bouton
+# "🔎 Vérifier les liens" sous les résultats de recherche.
+
+LINK_CHECK_TIMEOUT_SECONDS = 6
+LINK_CHECK_MAX_WORKERS = 10
+
+# --- Paramètres spécifiques aux vérifications EN MASSE ---
+# (upload d'un fichier, /verifierbase) : concurrence volontairement
+# très faible et pauses entre paquets, car le serveur d'hébergement
+# tourne avec des ressources extrêmement limitées (0.1 CPU, 512 Mo
+# de RAM). Le bouton "Vérifier cette page" (peu de liens à la fois)
+# n'a pas besoin de ces précautions et garde ses propres réglages
+# plus rapides ci-dessus.
+BULK_CHECK_MAX_WORKERS = 3
+BULK_CHECK_BATCH_SIZE = 15
+BULK_CHECK_BATCH_PAUSE_SECONDS = 1.5
+
+# Nombre maximum de liens uniques testés en une seule fois, pour
+# ne jamais bloquer un worker du bot trop longtemps ni saturer le
+# serveur avec un fichier ou une base trop volumineuse.
+MAX_LINKS_CHECK_UPLOAD = 150
+MAX_LINKS_CHECK_VERIFYBASE = 500
+
+
+def extract_first_url(block: str) -> Optional[str]:
+    """Extrait la première URL http(s) trouvée dans un bloc."""
+    match = re.search(r"https?://[^\s]+", block)
+    return match.group(0) if match else None
+
+
+def check_link_alive(url: str) -> bool:
+    """
+    Teste si un lien répond encore. Retourne False au moindre doute
+    (timeout, erreur de connexion, code d'erreur HTTP) — mieux vaut
+    un léger risque de faux "expiré" qu'un faux "actif".
+    """
+    if not REQUESTS_AVAILABLE:
+        return True  # pas de vérification possible, on n'affirme rien de faux
+
+    try:
+        response = requests.get(
+            url,
+            timeout=LINK_CHECK_TIMEOUT_SECONDS,
+            stream=True,
+            allow_redirects=True
+        )
+
+        alive = response.status_code < 400
+        response.close()
+
+        return alive
+
+    except Exception:
+        return False
+
+
+def check_urls_status(
+    urls: List[str],
+    max_workers: int = LINK_CHECK_MAX_WORKERS,
+    batch_size: Optional[int] = None,
+    batch_pause_seconds: float = 0
+) -> Dict[str, bool]:
+    """
+    Teste une liste d'URLs et retourne {url: True/False}.
+
+    batch_size + batch_pause_seconds permettent de traiter les URLs
+    par petits paquets avec une pause entre chaque paquet, pour ne
+    jamais saturer un serveur aux ressources très limitées.
+    Utilisé pour les vérifications EN MASSE (upload, /verifierbase),
+    contrairement au bouton "Vérifier cette page" qui teste peu de
+    liens d'un coup et n'a pas besoin de ce ménagement.
+    """
+    if not urls:
+        return {}
+
+    results: Dict[str, bool] = {}
+
+    batches = (
+        [urls[i:i + batch_size] for i in range(0, len(urls), batch_size)]
+        if batch_size
+        else [urls]
+    )
+
+    for batch_index, batch in enumerate(batches):
+
+        with ThreadPoolExecutor(
+            max_workers=min(max_workers, len(batch))
+        ) as executor:
+
+            future_to_url = {
+                executor.submit(check_link_alive, url): url
+                for url in batch
+            }
+
+            for future in future_to_url:
+                url = future_to_url[future]
+                try:
+                    results[url] = future.result()
+                except Exception:
+                    results[url] = False
+
+        # Pause entre chaque paquet : laisse le CPU respirer avant
+        # d'attaquer le paquet suivant (important sur un serveur à
+        # ressources très limitées).
+        if batch_pause_seconds and batch_index < len(batches) - 1:
+            time.sleep(batch_pause_seconds)
+
+    return results
+
+
+def check_links_status(blocks: List[str]) -> Dict[str, bool]:
+    """
+    Teste les liens uniques trouvés dans une liste de blocs.
+    Utilisé par le bouton "Vérifier cette page" (peu de liens,
+    pas besoin de traitement par paquets).
+    """
+    urls = []
+
+    for block in blocks:
+        url = extract_first_url(block)
+        if url and url not in urls:
+            urls.append(url)
+
+    return check_urls_status(urls, max_workers=LINK_CHECK_MAX_WORKERS)
+
+
+def annotate_blocks_with_status(
+    blocks: List[str],
+    status: Dict[str, bool]
+) -> List[str]:
+    """
+    Ajoute ✅/❌ en tête de chaque bloc selon le statut de son lien.
+    Les blocs sans URL détectable ne sont pas annotés.
+    """
+    annotated = []
+
+    for block in blocks:
+        url = extract_first_url(block)
+
+        if url and url in status:
+            prefix = "✅ " if status[url] else "❌ "
+            annotated.append(prefix + block)
+        else:
+            annotated.append(block)
+
+    return annotated
 
 
 STATS_RPC_FUNCTION = "count_m3u_stats"
@@ -1207,6 +1610,17 @@ def build_pagination_markup(
         if nav_buttons:
             markup.row(*nav_buttons)
 
+    if REQUESTS_AVAILABLE:
+
+        markup.row(
+            InlineKeyboardButton(
+                "🔎 Vérifier les liens de cette page",
+                callback_data=(
+                    f"verify_{search_id}_{current_page}"
+                )
+            )
+        )
+
     return markup
 
 
@@ -1566,6 +1980,8 @@ def help_handler(message):
 📊 /stats (authentification requise)
 
 🧱 /reindex (authentification requise, admin)
+
+🧹 /verifierbase (authentification requise, admin)
 
 📤 Administrateur :
 envoyer un fichier .txt (authentification requise)
@@ -1951,6 +2367,291 @@ def reindex_handler(message):
 
 
 # ============================================================
+# /VERIFIERBASE - VÉRIFICATION EN MASSE DES LIENS (ADMIN)
+# ============================================================
+# Scanne tous les fichiers de la base, teste chaque lien unique,
+# puis propose une suppression manuelle (jamais automatique) des
+# liens morts trouvés. Concurrence volontairement très faible et
+# traitement par paquets (BULK_CHECK_*) pour ménager un serveur
+# aux ressources très limitées.
+
+cleanup_state: Dict[str, Dict] = {}
+CLEANUP_STATE_EXPIRY_SECONDS = 3600
+
+
+def get_all_blocks_for_scan() -> List[Dict]:
+    """
+    Retourne tous les blocs de tous les fichiers, sous la forme
+    [{"filename": ..., "block": ...}, ...].
+
+    Chemin rapide : lit directement la table m3u_blocks, déjà
+    découpée à l'upload — aucun reparsing nécessaire côté Render,
+    et on ne rapatrie que le texte des blocs (pas les fichiers
+    entiers, ni les colonnes inutiles). Même principe que pour
+    /m3u et /stats.
+
+    Repli automatique : si la table n'existe pas encore (migration
+    non appliquée), reparse tous les fichiers m3u_files comme
+    avant — comportement identique, juste plus lent.
+    """
+    if supabase:
+        try:
+            response = supabase.table(BLOCKS_TABLE).select(
+                "filename, block_content"
+            ).execute()
+
+            return [
+                {
+                    "filename": row["filename"],
+                    "block": row["block_content"]
+                }
+                for row in (response.data or [])
+                if row.get("block_content")
+            ]
+
+        except Exception as e:
+            logger.warning(
+                "⚠️ Lecture directe de m3u_blocks impossible pour "
+                "/verifierbase (migration SQL probablement non "
+                f"appliquée) — repli sur reparsing complet. "
+                f"Détail : {e}"
+            )
+
+    blocks: List[Dict] = []
+
+    for file_data in get_all_files_from_supabase():
+
+        filename = file_data.get("filename")
+        file_content = file_data.get("file_content", "")
+
+        if not filename or not file_content:
+            continue
+
+        for block in split_file_into_blocks(file_content):
+            blocks.append({"filename": filename, "block": block})
+
+    return blocks
+
+
+@bot.message_handler(commands=["verifierbase"])
+def verifierbase_handler(message):
+
+    logger.info(
+        f"📩 /verifierbase reçu de user_id="
+        f"{message.from_user.id}"
+    )
+
+    user_id = message.from_user.id
+    chat_type = message.chat.type
+
+    if chat_type == "private":
+
+        if not is_user_authenticated(user_id):
+
+            bot.reply_to(
+                message,
+                "🔐 Accès protégé.\n\n"
+                "Veuillez vous authentifier en envoyant "
+                "le mot de passe en message privé."
+            )
+
+            return
+
+    else:
+
+        # Silence volontaire dans un groupe : commande admin,
+        # jamais révélée ni utilisable en dehors du privé.
+        return
+
+    try:
+
+        if not is_admin(user_id):
+
+            bot.reply_to(
+                message,
+                "❌ Permission refusée. "
+                "Vous n'êtes pas administrateur."
+            )
+
+            return
+
+        if not supabase:
+
+            bot.reply_to(
+                message,
+                "❌ Supabase n'est pas configuré."
+            )
+
+            return
+
+        if not REQUESTS_AVAILABLE:
+
+            bot.reply_to(
+                message,
+                "❌ Vérification indisponible sur ce serveur "
+                "(module 'requests' manquant)."
+            )
+
+            return
+
+        progress_msg = bot.reply_to(
+            message,
+            "🔎 Vérification de la base en cours...\n\n"
+            "⚠️ Traitement volontairement lent pour ménager "
+            "les ressources du serveur — cela peut prendre "
+            "plusieurs minutes, merci de patienter."
+        )
+
+        all_blocks = get_all_blocks_for_scan()
+
+        # Associe chaque URL unique à tous les blocs/fichiers où
+        # elle apparaît, pour pouvoir cibler la suppression plus
+        # tard sans tout re-scanner. original_name n'est pas suivi
+        # ici : il sera relu (pour les seuls fichiers réellement
+        # modifiés) au moment de la suppression confirmée.
+        url_to_occurrences: Dict[str, List[Dict]] = {}
+        total_blocks_scanned = 0
+
+        for entry in all_blocks:
+
+            filename = entry["filename"]
+            block = entry["block"]
+
+            url = extract_first_url(block)
+
+            if not url:
+                continue
+
+            total_blocks_scanned += 1
+
+            url_to_occurrences.setdefault(
+                url, []
+            ).append({
+                "filename": filename,
+                "block": block
+            })
+
+        urls_uniques = list(url_to_occurrences.keys())
+
+        limite_atteinte = (
+            len(urls_uniques) > MAX_LINKS_CHECK_VERIFYBASE
+        )
+
+        urls_a_tester = urls_uniques[:MAX_LINKS_CHECK_VERIFYBASE]
+
+        statut_liens = check_urls_status(
+            urls_a_tester,
+            max_workers=BULK_CHECK_MAX_WORKERS,
+            batch_size=BULK_CHECK_BATCH_SIZE,
+            batch_pause_seconds=BULK_CHECK_BATCH_PAUSE_SECONDS
+        )
+
+        urls_mortes = [
+            url
+            for url, vivant in statut_liens.items()
+            if not vivant
+        ]
+
+        rapport = (
+            "🔎 Vérification terminée\n\n"
+            f"📦 {total_blocks_scanned} lien(s) scanné(s) au total\n"
+            f"🔗 {len(urls_uniques)} lien(s) unique(s)\n"
+            f"🧪 {len(urls_a_tester)} lien(s) unique(s) testé(s)\n"
+            f"✅ {len(urls_a_tester) - len(urls_mortes)} actif(s)\n"
+            f"❌ {len(urls_mortes)} mort(s)\n"
+        )
+
+        if limite_atteinte:
+            rapport += (
+                f"\nℹ️ Limite de {MAX_LINKS_CHECK_VERIFYBASE} "
+                "liens testés par exécution atteinte (protection "
+                "des ressources) — relance /verifierbase plus "
+                "tard pour continuer sur le reste.\n"
+            )
+
+        if not urls_mortes:
+
+            rapport += "\n✨ Aucun lien mort trouvé."
+
+            bot.edit_message_text(
+                rapport,
+                progress_msg.chat.id,
+                progress_msg.message_id
+            )
+
+            return
+
+        # Prépare l'état de nettoyage — la suppression réelle
+        # n'aura lieu qu'après confirmation manuelle via le bouton.
+        cleanup_id = f"{message.chat.id}|{int(time.time())}"
+
+        dead_by_file: Dict[str, List[str]] = {}
+
+        for url in urls_mortes:
+            for occ in url_to_occurrences.get(url, []):
+
+                fname = occ["filename"]
+
+                dead_by_file.setdefault(fname, [])
+                dead_by_file[fname].append(occ["block"])
+
+        cleanup_state[cleanup_id] = {
+            "chat_id": message.chat.id,
+            "dead_by_file": dead_by_file,
+            "dead_links_count": len(urls_mortes),
+            "timestamp": time.time()
+        }
+
+        from telebot.types import (
+            InlineKeyboardMarkup,
+            InlineKeyboardButton
+        )
+
+        markup = InlineKeyboardMarkup()
+
+        markup.row(
+            InlineKeyboardButton(
+                f"🗑 Supprimer les {len(urls_mortes)} lien(s) mort(s)",
+                callback_data=f"cleandead_{cleanup_id}"
+            )
+        )
+
+        markup.row(
+            InlineKeyboardButton(
+                "❌ Ne rien supprimer",
+                callback_data=f"cancelclean_{cleanup_id}"
+            )
+        )
+
+        rapport += (
+            "\nSouhaites-tu supprimer ces liens morts de la base ?"
+        )
+
+        bot.edit_message_text(
+            rapport,
+            progress_msg.chat.id,
+            progress_msg.message_id,
+            reply_markup=markup
+        )
+
+    except Exception as e:
+
+        logger.exception(
+            f"❌ Erreur /verifierbase : {e}"
+        )
+
+        try:
+
+            bot.reply_to(
+                message,
+                f"❌ Erreur : {e}"
+            )
+
+        except Exception:
+            pass
+
+
+# ============================================================
 # RÉCEPTION DES FICHIERS TXT
 # ============================================================
 
@@ -2066,9 +2767,80 @@ def document_handler(message):
             f"{document.file_name}"
         )
 
-        file_content = downloaded_file.decode(
+        file_content_brut = downloaded_file.decode(
             "utf-8",
             errors="ignore"
+        )
+
+        # --- Dédoublonnage à l'upload ---
+        # On découpe le fichier reçu en blocs, puis on ne garde que
+        # les blocs réellement nouveaux (ni déjà présents ailleurs,
+        # ni répétés dans ce même fichier). filter_new_blocks_smart
+        # essaie d'abord le calcul rapide côté Supabase (comme pour
+        # /m3u et /stats), et ne rapatrie tout que si la migration
+        # SQL n'a pas encore été appliquée.
+        blocks_uploades = split_file_into_blocks(file_content_brut)
+
+        filtre = filter_new_blocks_smart(blocks_uploades)
+
+        blocs_conserves = filtre["kept"]
+        doublons_ignores = filtre["duplicates_count"]
+
+        # --- Vérification des liens morts à l'upload ---
+        # Teste uniquement les blocs déjà dédupliqués (jamais les
+        # doublons qu'on vient de rejeter, inutile de les tester).
+        # Concurrence volontairement faible + traitement par
+        # paquets avec pauses (BULK_CHECK_*), pour ne jamais
+        # surcharger un serveur aux ressources très limitées.
+        # Si le fichier contient trop de liens uniques, la
+        # vérification est désactivée pour cet upload plutôt que
+        # de risquer de bloquer le bot trop longtemps.
+        liens_morts_ignores = 0
+        verification_desactivee = False
+
+        if REQUESTS_AVAILABLE and blocs_conserves:
+
+            url_par_bloc = {}
+            urls_a_tester = []
+
+            for block in blocs_conserves:
+                url = extract_first_url(block)
+                if url:
+                    url_par_bloc[block] = url
+                    if url not in urls_a_tester:
+                        urls_a_tester.append(url)
+
+            if len(urls_a_tester) > MAX_LINKS_CHECK_UPLOAD:
+
+                verification_desactivee = True
+
+            elif urls_a_tester:
+
+                statut_liens = check_urls_status(
+                    urls_a_tester,
+                    max_workers=BULK_CHECK_MAX_WORKERS,
+                    batch_size=BULK_CHECK_BATCH_SIZE,
+                    batch_pause_seconds=BULK_CHECK_BATCH_PAUSE_SECONDS
+                )
+
+                blocs_vivants = []
+
+                for block in blocs_conserves:
+                    url = url_par_bloc.get(block)
+
+                    if url and statut_liens.get(url) is False:
+                        liens_morts_ignores += 1
+                    else:
+                        blocs_vivants.append(block)
+
+                blocs_conserves = blocs_vivants
+
+        # On reconstruit le contenu du fichier uniquement à partir
+        # des blocs uniques et vivants conservés.
+        file_content = (
+            ("\n" + BLOCK_SEPARATOR + "\n").join(blocs_conserves)
+            if blocs_conserves
+            else ""
         )
 
         link_count = 0
@@ -2083,12 +2855,24 @@ def document_handler(message):
             ):
                 link_count += 1
 
+        if not blocs_conserves:
+
+            bot.reply_to(
+                message,
+                "⚠️ Aucun lien nouveau et valide dans ce fichier.\n\n"
+                f"🔁 {doublons_ignores} doublon(s) déjà présent(s)\n"
+                f"❌ {liens_morts_ignores} lien(s) mort(s) ignoré(s)\n\n"
+                "Rien n'a été ajouté."
+            )
+
+            return
+
         success = save_file_to_supabase(
             filename=filename,
             original_name=document.file_name,
             file_content=file_content,
             links_count=link_count,
-            file_size=document.file_size
+            file_size=len(file_content.encode("utf-8"))
         )
 
         if success:
@@ -2100,17 +2884,42 @@ def document_handler(message):
             # l'ancienne méthode.
             index_blocks_for_file(filename, file_content)
 
-            bot.reply_to(
-                message,
+            message_confirmation = (
                 "✅ Fichier ajouté dans Supabase !\n\n"
                 f"📁 {document.file_name}\n\n"
-                f"🔗 {link_count} liens\n\n"
-                "💾 Stockage cloud activé."
+                f"🔗 {link_count} liens uniques et valides ajoutés\n"
+            )
+
+            if doublons_ignores > 0:
+                message_confirmation += (
+                    f"🔁 {doublons_ignores} doublon(s) ignoré(s)\n"
+                )
+
+            if liens_morts_ignores > 0:
+                message_confirmation += (
+                    f"❌ {liens_morts_ignores} lien(s) mort(s) ignoré(s)\n"
+                )
+
+            if verification_desactivee:
+                message_confirmation += (
+                    "ℹ️ Vérification de validité désactivée pour "
+                    f"cet upload (plus de {MAX_LINKS_CHECK_UPLOAD} "
+                    "liens uniques — protège les ressources du "
+                    "serveur)\n"
+                )
+
+            message_confirmation += "\n💾 Stockage cloud activé."
+
+            bot.reply_to(
+                message,
+                message_confirmation
             )
 
             logger.info(
                 f"✅ Fichier sauvegardé dans Supabase : "
-                f"{filename} ({link_count} liens)"
+                f"{filename} ({link_count} liens valides, "
+                f"{doublons_ignores} doublons ignorés, "
+                f"{liens_morts_ignores} liens morts ignorés)"
             )
 
         else:
@@ -2478,6 +3287,255 @@ def callback_handler(call):
                     call.id,
                     "❌ Format de pagination invalide"
                 )
+
+        elif call.data.startswith("verify_"):
+
+            # Format attendu : verify_{chat_id}|{timestamp}_{page}
+            # Même découpage que pour "page_" (le search_id contient "|").
+            parts = call.data.split("_", 2)
+
+            if len(parts) == 3:
+
+                search_id = parts[1]
+                page_str = parts[2]
+
+                try:
+                    target_page = int(page_str)
+
+                    if search_id not in pagination_state:
+                        bot.answer_callback_query(
+                            call.id,
+                            "❌ Résultats expirés, relance une recherche."
+                        )
+                        return
+
+                    if not REQUESTS_AVAILABLE:
+                        bot.answer_callback_query(
+                            call.id,
+                            "❌ Vérification indisponible sur ce serveur."
+                        )
+                        return
+
+                    bot.answer_callback_query(
+                        call.id,
+                        "🔎 Vérification en cours..."
+                    )
+
+                    state = pagination_state[search_id]
+                    all_results = state.get("results", [])
+
+                    page_results = get_page_results(
+                        all_results,
+                        target_page
+                    )
+
+                    # Le test des liens (requêtes HTTP) se fait en
+                    # arrière-plan : le webhook Telegram a déjà reçu
+                    # sa réponse "OK" bien avant, donc pas de risque
+                    # de timeout côté Telegram.
+                    status = check_links_status(page_results)
+
+                    annotated_results = annotate_blocks_with_status(
+                        page_results,
+                        status
+                    )
+
+                    total_pages = state.get("total_pages", 1)
+
+                    formatted_text = format_page_results(
+                        annotated_results,
+                        len(all_results),
+                        target_page,
+                        total_pages
+                    )
+
+                    markup = build_pagination_markup(
+                        call.message.chat.id,
+                        search_id,
+                        target_page,
+                        total_pages
+                    )
+
+                    try:
+                        bot.edit_message_text(
+                            formatted_text,
+                            call.message.chat.id,
+                            call.message.message_id,
+                            reply_markup=markup
+                        )
+                    except Exception as e:
+                        logger.warning(
+                            "⚠️ Erreur lors de l'affichage "
+                            f"des résultats vérifiés : {e}"
+                        )
+
+                except ValueError:
+
+                    bot.answer_callback_query(
+                        call.id,
+                        "❌ Erreur de vérification"
+                    )
+
+            else:
+
+                bot.answer_callback_query(
+                    call.id,
+                    "❌ Format de vérification invalide"
+                )
+
+        elif call.data.startswith("cleandead_"):
+
+            cleanup_id = call.data[len("cleandead_"):]
+
+            if not is_admin(call.from_user.id):
+
+                bot.answer_callback_query(
+                    call.id,
+                    "❌ Réservé aux administrateurs."
+                )
+
+                return
+
+            state = cleanup_state.get(cleanup_id)
+
+            if (
+                not state
+                or time.time() - state.get("timestamp", 0)
+                > CLEANUP_STATE_EXPIRY_SECONDS
+            ):
+
+                cleanup_state.pop(cleanup_id, None)
+
+                bot.answer_callback_query(
+                    call.id,
+                    "❌ Cette demande a expiré, relance /verifierbase."
+                )
+
+                return
+
+            bot.answer_callback_query(
+                call.id,
+                "🧹 Suppression en cours..."
+            )
+
+            cleanup_state.pop(cleanup_id, None)
+
+            dead_by_file = state["dead_by_file"]
+
+            fichiers_modifies = 0
+            liens_supprimes = 0
+
+            for target_filename, dead_blocks in dead_by_file.items():
+
+                current_file = get_file_from_supabase(
+                    target_filename
+                )
+
+                if not current_file:
+                    continue
+
+                current_content = current_file.get(
+                    "file_content", ""
+                )
+                current_blocks = split_file_into_blocks(
+                    current_content
+                )
+
+                dead_signatures = {
+                    normalize_block_for_dedup(b)
+                    for b in dead_blocks
+                }
+
+                remaining_blocks = [
+                    b for b in current_blocks
+                    if normalize_block_for_dedup(b)
+                    not in dead_signatures
+                ]
+
+                removed_count = (
+                    len(current_blocks) - len(remaining_blocks)
+                )
+
+                if removed_count == 0:
+                    continue
+
+                new_content = (
+                    ("\n" + BLOCK_SEPARATOR + "\n").join(
+                        remaining_blocks
+                    )
+                    if remaining_blocks
+                    else ""
+                )
+
+                new_link_count = sum(
+                    1
+                    for line in new_content.split("\n")
+                    if line.strip()
+                    and not line.strip().startswith("#")
+                )
+
+                # original_name relu directement depuis le fichier
+                # existant (récupéré juste au-dessus) — pas besoin
+                # de l'avoir suivi depuis le scan initial.
+                original_name = current_file.get(
+                    "original_name", target_filename
+                )
+
+                delete_file_from_supabase(target_filename)
+
+                save_file_to_supabase(
+                    filename=target_filename,
+                    original_name=original_name,
+                    file_content=new_content,
+                    links_count=new_link_count,
+                    file_size=len(new_content.encode("utf-8"))
+                )
+
+                index_blocks_for_file(
+                    target_filename, new_content
+                )
+
+                fichiers_modifies += 1
+                liens_supprimes += removed_count
+
+            try:
+
+                bot.edit_message_text(
+                    "✅ Nettoyage terminé.\n\n"
+                    f"🗑 {liens_supprimes} lien(s) mort(s) supprimé(s)\n"
+                    f"📁 {fichiers_modifies} fichier(s) modifié(s)",
+                    call.message.chat.id,
+                    call.message.message_id
+                )
+
+            except Exception as e:
+
+                logger.warning(
+                    "⚠️ Erreur affichage résultat nettoyage : "
+                    f"{e}"
+                )
+
+        elif call.data.startswith("cancelclean_"):
+
+            cleanup_id = call.data[len("cancelclean_"):]
+            cleanup_state.pop(cleanup_id, None)
+
+            bot.answer_callback_query(
+                call.id,
+                "Annulé."
+            )
+
+            try:
+
+                bot.edit_message_text(
+                    "❌ Suppression annulée. Aucun lien n'a été "
+                    "retiré de la base.",
+                    call.message.chat.id,
+                    call.message.message_id
+                )
+
+            except Exception:
+                pass
 
         else:
 
