@@ -2843,16 +2843,9 @@ def verifierbase_handler(message):
             )
         )
 
-        markup.row(
-            InlineKeyboardButton(
-                "❌ Ne rien supprimer",
-                callback_data=f"cancelclean_{cleanup_id}"
-            )
-        )
-
         rapport += (
-            "\nSouhaites-tu supprimer ces liens morts/expirés "
-            "de la base ?"
+            "\nAppuie sur le bouton pour supprimer ces liens "
+            "morts/expirés de la base."
         )
 
         bot.edit_message_text(
@@ -3884,28 +3877,6 @@ def callback_handler(call):
                     "⚠️ Erreur affichage résultat nettoyage : "
                     f"{e}"
                 )
-
-        elif call.data.startswith("cancelclean_"):
-
-            cleanup_id = call.data[len("cancelclean_"):]
-            cleanup_state.pop(cleanup_id, None)
-
-            bot.answer_callback_query(
-                call.id,
-                "Annulé."
-            )
-
-            try:
-
-                bot.edit_message_text(
-                    "❌ Suppression annulée. Aucun lien n'a été "
-                    "retiré de la base.",
-                    call.message.chat.id,
-                    call.message.message_id
-                )
-
-            except Exception:
-                pass
 
         else:
 
