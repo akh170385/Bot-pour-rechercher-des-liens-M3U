@@ -1,5 +1,6 @@
 import os
 import re
+import io
 import json
 import time
 import logging
@@ -2656,18 +2657,24 @@ def process_upload_in_chunks(file_content: str) -> Dict[str, Any]:
          vu plus tôt dans CE fichier + contre la base, via RPC).
       2. Vérification de validité des liens du paquet (tant que le
          plafond global MAX_LINKS_CHECK_UPLOAD n'est pas atteint).
-      3. Les blocs survivants du paquet sont ajoutés au résultat
-         final ; le reste du paquet est ensuite oublié (libéré de
-         la mémoire) avant de passer au paquet suivant.
+      3. Les blocs survivants du paquet sont écrits directement
+         dans un buffer texte (io.StringIO) — jamais accumulés
+         dans une liste Python séparée, pour éviter qu'une liste
+         ET un texte joint ET une liste de lignes (pour compter
+         les liens) coexistent tous en mémoire en même temps.
 
-    Retourne un dict avec "kept_blocks", "duplicates_count",
-    "dead_count" et "verification_desactivee".
+    Retourne un dict avec "file_content" (déjà prêt à sauvegarder),
+    "link_count", "duplicates_count", "dead_count" et
+    "verification_desactivee".
     """
     seen_signatures: Set[str] = set()
-    kept_blocks: List[str] = []
+
+    content_buffer = io.StringIO()
+    first_block_written = False
 
     duplicates_count = 0
     dead_count = 0
+    link_count = 0
     links_tested_so_far = 0
     verification_desactivee = False
 
@@ -2676,6 +2683,25 @@ def process_upload_in_chunks(file_content: str) -> Dict[str, Any]:
     # FOIS pour tout le fichier (pas à chaque paquet), pour ne pas
     # refaire ce travail lourd des dizaines de fois de suite.
     legacy_existing_signatures: Optional[Set[str]] = None
+
+    def write_kept_block(block: str) -> None:
+        """
+        Écrit un bloc survivant directement dans le buffer texte
+        final, et compte ses liens au passage — sans jamais
+        reparcourir tout le fichier une deuxième fois pour ça.
+        """
+        nonlocal first_block_written, link_count
+
+        if first_block_written:
+            content_buffer.write("\n" + BLOCK_SEPARATOR + "\n")
+
+        content_buffer.write(block)
+        first_block_written = True
+
+        for line in block.split("\n"):
+            line = line.strip()
+            if line and not line.startswith("#"):
+                link_count += 1
 
     def flush_chunk(chunk_blocks: List[str]) -> None:
 
@@ -2776,13 +2802,14 @@ def process_upload_in_chunks(file_content: str) -> Dict[str, Any]:
                     if url and statut.get(url) is False:
                         dead_count += 1
                     else:
-                        kept_blocks.append(block)
+                        write_kept_block(block)
 
                 return
 
         # Vérification désactivée (plafond atteint) ou aucun lien
         # détecté dans ce paquet : on garde les blocs tels quels.
-        kept_blocks.extend(chunk_new_blocks)
+        for block in chunk_new_blocks:
+            write_kept_block(block)
 
     chunk: List[str] = []
 
@@ -2797,7 +2824,8 @@ def process_upload_in_chunks(file_content: str) -> Dict[str, Any]:
     flush_chunk(chunk)
 
     return {
-        "kept_blocks": kept_blocks,
+        "file_content": content_buffer.getvalue(),
+        "link_count": link_count,
         "duplicates_count": duplicates_count,
         "dead_count": dead_count,
         "verification_desactivee": verification_desactivee
@@ -2925,40 +2953,32 @@ def document_handler(message):
             errors="ignore"
         )
 
+        # Libère les octets bruts dès qu'on a le texte décodé —
+        # inutile de garder les deux versions en mémoire pendant
+        # tout le traitement qui suit.
+        del downloaded_file
+
         # --- Traitement par petits paquets (anti-OOM) ---
         # Dédoublonnage + vérification des liens morts, effectués
         # UPLOAD_CHUNK_SIZE blocs à la fois plutôt que tout garder
-        # en mémoire d'un coup. Voir process_upload_in_chunks pour
-        # le détail — nécessaire depuis le plantage constaté sur un
-        # fichier de 15 Mo.
+        # en mémoire d'un coup. Le contenu final et le comptage des
+        # liens sont déjà prêts en sortie — aucune reconstruction
+        # ni recomptage supplémentaire nécessaire ici (voir
+        # process_upload_in_chunks pour le détail).
         resultat = process_upload_in_chunks(file_content_brut)
 
-        blocs_conserves = resultat["kept_blocks"]
+        # Le texte brut original n'est plus nécessaire une fois le
+        # traitement terminé — seul resultat["file_content"] (déjà
+        # nettoyé) est gardé pour la suite.
+        del file_content_brut
+
+        file_content = resultat["file_content"]
+        link_count = resultat["link_count"]
         doublons_ignores = resultat["duplicates_count"]
         liens_morts_ignores = resultat["dead_count"]
         verification_desactivee = resultat["verification_desactivee"]
 
-        # On reconstruit le contenu du fichier uniquement à partir
-        # des blocs uniques et vivants conservés.
-        file_content = (
-            ("\n" + BLOCK_SEPARATOR + "\n").join(blocs_conserves)
-            if blocs_conserves
-            else ""
-        )
-
-        link_count = 0
-
-        for line in file_content.split("\n"):
-
-            line = line.strip()
-
-            if (
-                line
-                and not line.startswith("#")
-            ):
-                link_count += 1
-
-        if not blocs_conserves:
+        if not file_content:
 
             bot.reply_to(
                 message,
