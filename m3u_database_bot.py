@@ -7,7 +7,7 @@ import hashlib
 import logging
 import threading
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime
+from datetime import datetime, date
 from typing import List, Set, Dict, Optional, Any
 
 import telebot
@@ -143,13 +143,37 @@ def _process_update_background(update, update_id):
 # ============================================================
 
 def get_all_files_from_supabase() -> List[Dict]:
-    """Récupère tous les fichiers depuis Supabase."""
+    """
+    Récupère tous les fichiers depuis Supabase.
+
+    Pagination par pages de 1000 (limite par défaut de
+    Supabase/PostgREST) — improbable d'avoir plus de 1000 fichiers
+    uploadés un jour, mais autant rester correct dans tous les cas.
+    """
     if not supabase:
         return []
 
     try:
-        response = supabase.table("m3u_files").select("*").execute()
-        return response.data
+        all_rows: List[Dict] = []
+        page_size = 1000
+        offset = 0
+
+        while True:
+
+            response = supabase.table("m3u_files").select(
+                "*"
+            ).range(offset, offset + page_size - 1).execute()
+
+            page_rows = response.data or []
+            all_rows.extend(page_rows)
+
+            if len(page_rows) < page_size:
+                break
+
+            offset += page_size
+
+        return all_rows
+
     except Exception as e:
         logger.exception(f"❌ Erreur récupération fichiers Supabase: {e}")
         return []
@@ -785,6 +809,28 @@ def extract_first_url(block: str) -> Optional[str]:
     """Extrait la première URL http(s) trouvée dans un bloc."""
     match = re.search(r"https?://[^\s]+", block)
     return match.group(0) if match else None
+
+
+def extract_expiration_date(block: str) -> Optional[datetime]:
+    """
+    Extrait la date d'expiration déjà écrite dans le bloc
+    (format "Exp : JJ/MM/AAAA", comme dans les résultats /m3u),
+    sans faire de requête réseau. Retourne None si aucune date
+    n'est trouvée ou si le format ne correspond pas.
+    """
+    match = re.search(
+        r"Exp\s*:\s*(\d{2}/\d{2}/\d{4})",
+        block,
+        re.IGNORECASE
+    )
+
+    if not match:
+        return None
+
+    try:
+        return datetime.strptime(match.group(1), "%d/%m/%Y")
+    except ValueError:
+        return None
 
 
 def check_link_alive(url: str) -> bool:
@@ -2371,9 +2417,103 @@ def reindex_handler(message):
 # liens morts trouvés. Concurrence volontairement très faible et
 # traitement par paquets (BULK_CHECK_*) pour ménager un serveur
 # aux ressources très limitées.
+#
+# Deux vérifications complémentaires et bien distinctes :
+#  1) Par DATE D'EXPIRATION (champ "Exp" déjà présent dans chaque
+#     bloc) : pure lecture de texte, aucune requête réseau, donc
+#     appliquée à TOUS les blocs à chaque exécution, sans limite.
+#  2) Par TEST RÉSEAU (le serveur répond-il encore) : reste
+#     plafonné à MAX_LINKS_CHECK_VERIFYBASE liens par exécution,
+#     mais avec une progression sauvegardée dans Supabase (table
+#     bot_state) pour que chaque nouvelle exécution continue là où
+#     la précédente s'est arrêtée, au lieu de retester en boucle
+#     les mêmes premiers liens.
+
+BOT_STATE_TABLE = "bot_state"
+VERIFIERBASE_HTTP_OFFSET_KEY = "verifierbase_http_offset"
 
 cleanup_state: Dict[str, Dict] = {}
 CLEANUP_STATE_EXPIRY_SECONDS = 3600
+
+
+def get_bot_state(key: str) -> Optional[str]:
+    """
+    Lit une valeur persistante depuis la table bot_state (simple
+    table clé/valeur). Utilisée pour se souvenir d'une progression
+    entre deux exécutions de /verifierbase.
+    """
+    if not supabase:
+        return None
+
+    try:
+        response = supabase.table(BOT_STATE_TABLE).select(
+            "value"
+        ).eq("key", key).execute()
+
+        rows = response.data or []
+
+        if rows:
+            return rows[0].get("value")
+
+        return None
+
+    except Exception as e:
+        logger.warning(
+            f"⚠️ Lecture bot_state '{key}' impossible "
+            f"(migration SQL non appliquée ?) : {e}"
+        )
+
+        return None
+
+
+def set_bot_state(key: str, value: str) -> None:
+    """Écrit (ou met à jour) une valeur persistante dans bot_state."""
+    if not supabase:
+        return
+
+    try:
+        supabase.table(BOT_STATE_TABLE).upsert({
+            "key": key,
+            "value": value
+        }).execute()
+
+    except Exception as e:
+        logger.warning(
+            f"⚠️ Écriture bot_state '{key}' impossible : {e}"
+        )
+
+
+def extract_expiration_date(block: str) -> Optional[date]:
+    """
+    Cherche un champ "Exp : JJ/MM/AAAA" (ou avec des tirets) dans
+    le bloc et retourne la date correspondante si trouvée.
+    Aucune requête réseau — pure lecture de texte déjà en mémoire.
+    """
+    match = re.search(
+        r"exp\s*:?\s*(\d{1,2})[/\-](\d{1,2})[/\-](\d{4})",
+        block,
+        re.IGNORECASE
+    )
+
+    if not match:
+        return None
+
+    day_str, month_str, year_str = match.groups()
+
+    try:
+        return date(int(year_str), int(month_str), int(day_str))
+    except ValueError:
+        return None
+
+
+def is_expired_by_date(block: str) -> bool:
+    """True si le bloc contient une date d'expiration déjà passée."""
+    exp_date = extract_expiration_date(block)
+
+    if exp_date is None:
+        return False
+
+    return exp_date < date.today()
 
 
 def get_all_blocks_for_scan() -> List[Dict]:
@@ -2387,22 +2527,44 @@ def get_all_blocks_for_scan() -> List[Dict]:
     entiers, ni les colonnes inutiles). Même principe que pour
     /m3u et /stats.
 
+    Pagination : Supabase/PostgREST plafonne une requête à 1000
+    lignes par défaut. Sans pagination, une base de plus de 1000
+    blocs n'aurait été scannée qu'à moitié (ou moins) sans jamais
+    le signaler. On boucle donc par pages de PAGE_SIZE jusqu'à
+    avoir tout récupéré.
+
     Repli automatique : si la table n'existe pas encore (migration
     non appliquée), reparse tous les fichiers m3u_files comme
     avant — comportement identique, juste plus lent.
     """
     if supabase:
         try:
-            response = supabase.table(BLOCKS_TABLE).select(
-                "filename, block_content"
-            ).execute()
+            all_rows: List[Dict] = []
+            page_size = 1000
+            offset = 0
+
+            while True:
+
+                response = supabase.table(BLOCKS_TABLE).select(
+                    "filename, block_content"
+                ).range(
+                    offset, offset + page_size - 1
+                ).execute()
+
+                page_rows = response.data or []
+                all_rows.extend(page_rows)
+
+                if len(page_rows) < page_size:
+                    break
+
+                offset += page_size
 
             return [
                 {
                     "filename": row["filename"],
                     "block": row["block_content"]
                 }
-                for row in (response.data or [])
+                for row in all_rows
                 if row.get("block_content")
             ]
 
@@ -2500,41 +2662,87 @@ def verifierbase_handler(message):
         )
 
         all_blocks = get_all_blocks_for_scan()
+        total_blocks_scanned = len(all_blocks)
 
-        # Associe chaque URL unique à tous les blocs/fichiers où
-        # elle apparaît, pour pouvoir cibler la suppression plus
-        # tard sans tout re-scanner. original_name n'est pas suivi
-        # ici : il sera relu (pour les seuls fichiers réellement
-        # modifiés) au moment de la suppression confirmée.
-        url_to_occurrences: Dict[str, List[Dict]] = {}
-        total_blocks_scanned = 0
+        # --- Étape 1 : vérification par date d'expiration ---
+        # Faite sur TOUS les blocs, sans aucune limite : c'est du
+        # texte déjà en mémoire (aucune requête réseau), donc sans
+        # coût significatif même sur une base de 100 000+ liens.
+        expired_by_file: Dict[str, List[str]] = {}
+        total_with_exp_date = 0
+        total_expired_by_date = 0
 
         for entry in all_blocks:
 
-            filename = entry["filename"]
             block = entry["block"]
+            exp_date = extract_expiration_date(block)
 
-            url = extract_first_url(block)
+            if exp_date is None:
+                continue
+
+            total_with_exp_date += 1
+
+            if exp_date < date.today():
+
+                total_expired_by_date += 1
+
+                filename = entry["filename"]
+                expired_by_file.setdefault(filename, [])
+                expired_by_file[filename].append(block)
+
+        # --- Étape 2 : vérification "le serveur répond encore" ---
+        # Plafonnée (MAX_LINKS_CHECK_VERIFYBASE liens testés par
+        # exécution) car ceci nécessite une vraie requête réseau
+        # par lien — contrairement à la date, ça ne peut pas se
+        # faire sans coût sur 100 000+ liens d'un coup. La position
+        # de reprise est mémorisée dans Supabase (table bot_state),
+        # pas juste en mémoire, pour survivre à un redémarrage du
+        # serveur (fréquent sur l'hébergement gratuit) — chaque
+        # nouvelle exécution avance sur la suite de la liste au
+        # lieu de retester toujours les mêmes premiers liens.
+        url_to_occurrences: Dict[str, List[Dict]] = {}
+
+        for entry in all_blocks:
+
+            url = extract_first_url(entry["block"])
 
             if not url:
                 continue
 
-            total_blocks_scanned += 1
-
             url_to_occurrences.setdefault(
                 url, []
             ).append({
-                "filename": filename,
-                "block": block
+                "filename": entry["filename"],
+                "block": entry["block"]
             })
 
         urls_uniques = list(url_to_occurrences.keys())
 
-        limite_atteinte = (
-            len(urls_uniques) > MAX_LINKS_CHECK_VERIFYBASE
+        try:
+            start_offset = int(
+                get_bot_state(VERIFIERBASE_HTTP_OFFSET_KEY) or "0"
+            )
+        except ValueError:
+            start_offset = 0
+
+        if start_offset >= len(urls_uniques):
+            start_offset = 0
+
+        end_offset = start_offset + MAX_LINKS_CHECK_VERIFYBASE
+
+        urls_a_tester = urls_uniques[start_offset:end_offset]
+
+        couverture_complete = (
+            len(urls_uniques) <= MAX_LINKS_CHECK_VERIFYBASE
         )
 
-        urls_a_tester = urls_uniques[:MAX_LINKS_CHECK_VERIFYBASE]
+        next_offset = (
+            0 if end_offset >= len(urls_uniques) else end_offset
+        )
+
+        set_bot_state(
+            VERIFIERBASE_HTTP_OFFSET_KEY, str(next_offset)
+        )
 
         statut_liens = check_urls_status(
             urls_a_tester,
@@ -2549,26 +2757,57 @@ def verifierbase_handler(message):
             if not vivant
         ]
 
+        # --- Rapport combiné ---
         rapport = (
             "🔎 Vérification terminée\n\n"
-            f"📦 {total_blocks_scanned} lien(s) scanné(s) au total\n"
-            f"🔗 {len(urls_uniques)} lien(s) unique(s)\n"
-            f"🧪 {len(urls_a_tester)} lien(s) unique(s) testé(s)\n"
+            f"📦 {total_blocks_scanned} lien(s) scanné(s) au total\n\n"
+            "📅 Vérification par date d'expiration "
+            "(sur TOUS les liens) :\n"
+            f"🗓 {total_with_exp_date} lien(s) avec une date trouvée\n"
+            f"⌛ {total_expired_by_date} expiré(s) (date dépassée)\n\n"
+            "📡 Vérification \"serveur en ligne\" "
+            f"({len(urls_a_tester)} lien(s) testé(s) sur "
+            f"{len(urls_uniques)} unique(s)) :\n"
             f"✅ {len(urls_a_tester) - len(urls_mortes)} actif(s)\n"
-            f"❌ {len(urls_mortes)} mort(s)\n"
+            f"❌ {len(urls_mortes)} injoignable(s)\n"
         )
 
-        if limite_atteinte:
+        if not couverture_complete:
             rapport += (
-                f"\nℹ️ Limite de {MAX_LINKS_CHECK_VERIFYBASE} "
-                "liens testés par exécution atteinte (protection "
-                "des ressources) — relance /verifierbase plus "
-                "tard pour continuer sur le reste.\n"
+                f"\nℹ️ {MAX_LINKS_CHECK_VERIFYBASE} liens testés "
+                "par exécution (protection des ressources). "
+                "Relance /verifierbase plus tard pour continuer "
+                "automatiquement sur la suite de la liste "
+                f"(reprise prévue à partir du lien n°"
+                f"{next_offset + 1}, mémorisée même après un "
+                "redémarrage du serveur).\n"
             )
 
-        if not urls_mortes:
+        # --- Fusionne les deux listes de blocs à supprimer ---
+        # (un même bloc peut apparaître dans les deux, les doublons
+        # sont sans conséquence : ils seront naturellement
+        # dédoublonnés au moment de la suppression réelle.)
+        dead_by_file: Dict[str, List[str]] = {}
 
-            rapport += "\n✨ Aucun lien mort trouvé."
+        for url in urls_mortes:
+            for occ in url_to_occurrences.get(url, []):
+
+                fname = occ["filename"]
+                dead_by_file.setdefault(fname, [])
+                dead_by_file[fname].append(occ["block"])
+
+        for fname, blocks in expired_by_file.items():
+            dead_by_file.setdefault(fname, [])
+            dead_by_file[fname].extend(blocks)
+
+        total_a_supprimer = sum(
+            len(set(normalize_block_for_dedup(b) for b in blocks))
+            for blocks in dead_by_file.values()
+        )
+
+        if total_a_supprimer == 0:
+
+            rapport += "\n✨ Aucun lien mort ou expiré trouvé."
 
             bot.edit_message_text(
                 rapport,
@@ -2582,20 +2821,10 @@ def verifierbase_handler(message):
         # n'aura lieu qu'après confirmation manuelle via le bouton.
         cleanup_id = f"{message.chat.id}|{int(time.time())}"
 
-        dead_by_file: Dict[str, List[str]] = {}
-
-        for url in urls_mortes:
-            for occ in url_to_occurrences.get(url, []):
-
-                fname = occ["filename"]
-
-                dead_by_file.setdefault(fname, [])
-                dead_by_file[fname].append(occ["block"])
-
         cleanup_state[cleanup_id] = {
             "chat_id": message.chat.id,
             "dead_by_file": dead_by_file,
-            "dead_links_count": len(urls_mortes),
+            "dead_links_count": total_a_supprimer,
             "timestamp": time.time()
         }
 
@@ -2608,7 +2837,8 @@ def verifierbase_handler(message):
 
         markup.row(
             InlineKeyboardButton(
-                f"🗑 Supprimer les {len(urls_mortes)} lien(s) mort(s)",
+                f"🗑 Supprimer les {total_a_supprimer} lien(s) "
+                "mort(s)/expiré(s)",
                 callback_data=f"cleandead_{cleanup_id}"
             )
         )
@@ -2621,7 +2851,8 @@ def verifierbase_handler(message):
         )
 
         rapport += (
-            "\nSouhaites-tu supprimer ces liens morts de la base ?"
+            "\nSouhaites-tu supprimer ces liens morts/expirés "
+            "de la base ?"
         )
 
         bot.edit_message_text(
@@ -3641,7 +3872,7 @@ def callback_handler(call):
 
                 bot.edit_message_text(
                     "✅ Nettoyage terminé.\n\n"
-                    f"🗑 {liens_supprimes} lien(s) mort(s) supprimé(s)\n"
+                    f"🗑 {liens_supprimes} lien(s) mort(s)/expiré(s) supprimé(s)\n"
                     f"📁 {fichiers_modifies} fichier(s) modifié(s)",
                     call.message.chat.id,
                     call.message.message_id
