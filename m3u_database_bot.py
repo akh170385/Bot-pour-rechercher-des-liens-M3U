@@ -3,6 +3,7 @@ import re
 import io
 import json
 import time
+import hashlib
 import logging
 import threading
 from concurrent.futures import ThreadPoolExecutor
@@ -574,17 +575,32 @@ def reindex_all_files() -> Dict[str, int]:
 
 def normalize_block_for_dedup(block: str) -> str:
     """
-    Normalise un bloc pour la comparaison de doublons : espaces
-    multiples réduits, casse ignorée. Deux blocs identiques au
-    contenu près (mais avec des espaces différents) sont bien
-    considérés comme le même lien.
+    Calcule une signature de dédoublonnage pour un bloc : espaces
+    multiples réduits, casse ignorée, puis condensé en empreinte
+    SHA-256 (64 caractères fixes).
+
+    Pourquoi une empreinte et pas le texte normalisé tel quel :
+    certains blocs peuvent être anormalement longs (lignes mal
+    formatées, collées sans séparateur), et Postgres refuse
+    d'indexer une valeur texte trop grande ("index row size
+    exceeds btree maximum" — rencontré en production sur un bloc
+    inhabituellement gros). Une empreinte de taille fixe élimine
+    complètement ce risque, quelle que soit la taille du bloc
+    d'origine, tout en restant tout aussi fiable pour détecter les
+    doublons (deux blocs identiques donnent toujours la même
+    empreinte).
     """
     lines = [
         line.strip()
         for line in block.strip().split("\n")
         if line.strip()
     ]
-    return "\n".join(lines).lower()
+
+    normalized_text = "\n".join(lines).lower()
+
+    return hashlib.sha256(
+        normalized_text.encode("utf-8")
+    ).hexdigest()
 
 
 def dedupe_blocks(blocks: List[str]) -> List[str]:
