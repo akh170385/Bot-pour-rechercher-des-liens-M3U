@@ -9,6 +9,7 @@ import threading
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, date
 from typing import List, Set, Dict, Optional, Any
+from urllib.parse import urlparse, parse_qs, unquote
 
 import telebot
 from flask import Flask, request
@@ -253,6 +254,77 @@ def delete_file_from_supabase(filename: str) -> bool:
             f"❌ Erreur suppression fichier {filename}: {e}"
         )
         return False
+
+
+def update_file_content_in_supabase(
+    filename: str,
+    file_content: str,
+    links_count: int,
+    file_size: int
+) -> bool:
+    """
+    Met à jour le contenu d'un fichier existant EN PLACE, via une
+    seule requête UPDATE atomique — au lieu d'un DELETE suivi d'un
+    INSERT séparé.
+
+    Pourquoi c'est important : le DELETE+INSERT laissait une
+    fenêtre où un crash, une coupure réseau ou un redémarrage entre
+    les deux appels supprimait le fichier définitivement sans
+    jamais le réinsérer. C'est ce qui a causé la disparition totale
+    d'un fichier lors d'un nettoyage via /verifierbase. Une seule
+    requête UPDATE élimine ce risque : soit elle réussit et le
+    fichier est à jour, soit elle échoue et l'ancien contenu reste
+    intact tel quel.
+    """
+    if not supabase:
+        return False
+
+    try:
+        supabase.table("m3u_files").update({
+            "file_content": file_content,
+            "links_count": links_count,
+            "file_size": file_size
+        }).eq("filename", filename).execute()
+
+        return True
+
+    except Exception as e:
+        logger.exception(
+            f"❌ Erreur mise à jour fichier {filename}: {e}"
+        )
+        return False
+
+
+def backup_file_before_cleanup(
+    filename: str,
+    original_name: str,
+    file_content: str
+) -> None:
+    """
+    Sauvegarde le contenu ACTUEL d'un fichier avant toute
+    modification par /verifierbase, dans une table dédiée
+    (m3u_files_backup) — pour pouvoir le restaurer manuellement si
+    jamais un nettoyage se passe mal. Best-effort : un échec de
+    sauvegarde est loggé mais n'empêche pas la suite (mieux vaut
+    nettoyer sans sauvegarde que ne jamais nettoyer du tout).
+    """
+    if not supabase:
+        return
+
+    try:
+        supabase.table("m3u_files_backup").upsert({
+            "filename": filename,
+            "original_name": original_name,
+            "file_content": file_content,
+            "backed_up_at": datetime.now().isoformat()
+        }).execute()
+
+    except Exception as e:
+        logger.warning(
+            "⚠️ Sauvegarde de sécurité impossible avant nettoyage "
+            f"pour {filename} (table 'm3u_files_backup' absente ? "
+            f"migration SQL non appliquée ?) : {e}"
+        )
 
 
 def get_all_links_from_supabase() -> Set[str]:
@@ -597,23 +669,96 @@ def reindex_all_files() -> Dict[str, int]:
 #     ceci corrige aussi immédiatement les doublons déjà présents
 #     dans les fichiers uploadés AVANT cette mise à jour.
 
+def normalize_connection_url(block: str) -> Optional[str]:
+    """
+    Extrait l'identité réelle d'un compte à partir de son lien de
+    connexion (get.php?username=...&password=...), sous la forme
+    "host:port|username|password".
+
+    Ce qu'on ignore volontairement (jamais l'identité d'un compte) :
+      - le protocole (http/https)
+      - le chemin et les paramètres annexes (type=m3u_plus, etc.)
+
+    Ce qu'on ne modifie JAMAIS (identité réelle du compte) :
+      - le port (jamais déduit ni complété par une valeur par défaut)
+      - username / password (valeur exacte, casse conservée, juste
+        décodés avec unquote pour que la même valeur encodée
+        différemment dans l'URL ne soit pas ratée)
+
+    Seul le host est mis en minuscule (les noms de domaine ne sont
+    pas sensibles à la casse — norme internet, pas une simplification
+    risquée).
+
+    Retourne None si aucun lien de connexion n'est trouvé dans le
+    bloc, pour que l'appelant puisse retomber sur un repli sûr
+    plutôt que de fusionner à tort des entrées différentes.
+    """
+    url = extract_first_url(block)
+
+    if not url:
+        return None
+
+    try:
+        parsed = urlparse(url)
+    except Exception:
+        return None
+
+    host = (parsed.hostname or "").lower()
+
+    if not host:
+        return None
+
+    port = f":{parsed.port}" if parsed.port else ""
+
+    query = parse_qs(parsed.query)
+
+    username = query.get("username", [""])[0]
+    password = query.get("password", [""])[0]
+
+    if not username and not password:
+        # Pas de get.php avec identifiants reconnaissable — on ne
+        # peut pas garantir l'unicité du compte à partir de ça,
+        # mieux vaut laisser l'appelant utiliser son repli.
+        return None
+
+    # parse_qs() a déjà décodé username/password (percent-encoding
+    # et "+"). Un unquote() supplémentaire ici causerait un DOUBLE
+    # décodage et corromprait toute valeur contenant un "%" littéral
+    # suivi de deux chiffres (ex: mot de passe "abc%21def" ->
+    # transformé à tort en "abc!def"). Utiliser la valeur telle que
+    # renvoyée par parse_qs(), sans retraitement.
+
+    return f"{host}{port}|{username}|{password}"
+
+
 def normalize_block_for_dedup(block: str) -> str:
     """
-    Calcule une signature de dédoublonnage pour un bloc : espaces
-    multiples réduits, casse ignorée, puis condensé en empreinte
-    SHA-256 (64 caractères fixes).
+    Calcule une signature de dédoublonnage pour un bloc.
 
-    Pourquoi une empreinte et pas le texte normalisé tel quel :
-    certains blocs peuvent être anormalement longs (lignes mal
-    formatées, collées sans séparateur), et Postgres refuse
-    d'indexer une valeur texte trop grande ("index row size
-    exceeds btree maximum" — rencontré en production sur un bloc
-    inhabituellement gros). Une empreinte de taille fixe élimine
-    complètement ce risque, quelle que soit la taille du bloc
-    d'origine, tout en restant tout aussi fiable pour détecter les
-    doublons (deux blocs identiques donnent toujours la même
-    empreinte).
+    Clé principale : l'identité réelle du lien de connexion
+    (host:port|username|password, voir normalize_connection_url) —
+    pas le texte du bloc entier. Ça rend le dédoublonnage robuste
+    aux variations de métadonnées (Exp, Created, Conn, Media Info,
+    qui peuvent changer entre deux scans du même compte sans que le
+    compte lui-même ait changé).
+
+    Repli : si aucun lien de connexion reconnaissable n'est trouvé
+    dans le bloc (entrée malformée), on retombe sur l'ancien
+    comportement (hash du bloc entier normalisé) — jamais de perte
+    silencieuse d'une entrée simplement parce qu'elle est atypique.
+
+    Dans les deux cas, le résultat est condensé en empreinte
+    SHA-256 (64 caractères fixes), pour rester compatible avec la
+    limite de taille d'index Postgres déjà rencontrée en
+    production sur un bloc inhabituellement gros.
     """
+    connection_key = normalize_connection_url(block)
+
+    if connection_key is not None:
+        return hashlib.sha256(
+            connection_key.encode("utf-8")
+        ).hexdigest()
+
     lines = [
         line.strip()
         for line in block.strip().split("\n")
@@ -806,31 +951,32 @@ MAX_LINKS_CHECK_VERIFYBASE = 500
 
 
 def extract_first_url(block: str) -> Optional[str]:
-    """Extrait la première URL http(s) trouvée dans un bloc."""
-    match = re.search(r"https?://[^\s]+", block)
-    return match.group(0) if match else None
-
-
-def extract_expiration_date(block: str) -> Optional[datetime]:
     """
-    Extrait la date d'expiration déjà écrite dans le bloc
-    (format "Exp : JJ/MM/AAAA", comme dans les résultats /m3u),
-    sans faire de requête réseau. Retourne None si aucune date
-    n'est trouvée ou si le format ne correspond pas.
+    Extrait l'URL de CONNEXION réelle d'un bloc (avec identifiants
+    uniques : username/password), pas juste la première URL
+    trouvée.
+
+    Pourquoi c'est important : un bloc contient souvent plusieurs
+    URLs — le "Portal" (domaine seul, souvent partagé par des
+    dizaines ou centaines de comptes différents) ET le lien de
+    connexion complet type "get.php?username=...&password=..."
+    (unique à CE compte précis). Prendre la première URL trouvée
+    revient à tester le domaine partagé : si ce domaine devient
+    injoignable même temporairement, TOUS les comptes qui le
+    partagent seraient à tort déclarés morts en même temps —
+    potentiellement des centaines de blocs d'un coup pour un seul
+    domaine en panne passagère. En ciblant le lien avec les
+    identifiants, chaque compte est testé individuellement.
     """
-    match = re.search(
-        r"Exp\s*:\s*(\d{2}/\d{2}/\d{4})",
-        block,
-        re.IGNORECASE
+    get_php_match = re.search(
+        r"https?://\S*get\.php\S*", block, re.IGNORECASE
     )
 
-    if not match:
-        return None
+    if get_php_match:
+        return get_php_match.group(0)
 
-    try:
-        return datetime.strptime(match.group(1), "%d/%m/%Y")
-    except ValueError:
-        return None
+    match = re.search(r"https?://\S+", block)
+    return match.group(0) if match else None
 
 
 def check_link_alive(url: str) -> bool:
@@ -2817,6 +2963,73 @@ def verifierbase_handler(message):
 
             return
 
+        # --- Garde-fou anti-suppression massive ---
+        # Si les liens à supprimer représentent une trop grosse
+        # part d'un même fichier (par exemple si un domaine partagé
+        # par de nombreux comptes tombe temporairement en panne),
+        # on refuse d'offrir la suppression automatique — mieux
+        # vaut une fausse alerte à revérifier qu'un fichier vidé
+        # par erreur. Seuil volontairement prudent.
+        MASS_DELETE_THRESHOLD_RATIO = 0.30
+
+        total_blocks_per_file: Dict[str, int] = {}
+
+        for entry in all_blocks:
+            total_blocks_per_file[entry["filename"]] = (
+                total_blocks_per_file.get(entry["filename"], 0) + 1
+            )
+
+        fichiers_a_risque = []
+
+        for fname, blocks in dead_by_file.items():
+
+            nb_dead = len(
+                set(normalize_block_for_dedup(b) for b in blocks)
+            )
+            nb_total = total_blocks_per_file.get(fname, 0)
+
+            if nb_total > 0 and (
+                nb_dead / nb_total
+            ) > MASS_DELETE_THRESHOLD_RATIO:
+
+                fichiers_a_risque.append(
+                    (fname, nb_dead, nb_total)
+                )
+
+        if fichiers_a_risque:
+
+            rapport += (
+                "\n⚠️ SUPPRESSION AUTOMATIQUE BLOQUÉE PAR SÉCURITÉ\n\n"
+                "Un ou plusieurs fichiers auraient plus de "
+                f"{int(MASS_DELETE_THRESHOLD_RATIO * 100)}% de "
+                "leurs liens supprimés d'un coup — signe possible "
+                "d'un domaine partagé temporairement injoignable "
+                "plutôt que de vrais comptes morts :\n"
+            )
+
+            for fname, nb_dead, nb_total in fichiers_a_risque:
+                pourcentage = round((nb_dead / nb_total) * 100)
+                rapport += (
+                    f"• {fname} : {nb_dead}/{nb_total} liens "
+                    f"({pourcentage}%)\n"
+                )
+
+            rapport += (
+                "\nRelance /verifierbase un peu plus tard : si ce "
+                "sont de vrais domaines morts, le pourcentage "
+                "restera élevé. Si c'était une panne passagère, il "
+                "redescendra. Aucune suppression n'est proposée "
+                "tant que ce seuil est dépassé."
+            )
+
+            bot.edit_message_text(
+                rapport,
+                progress_msg.chat.id,
+                progress_msg.message_id
+            )
+
+            return
+
         # Prépare l'état de nettoyage — la suppression réelle
         # n'aura lieu qu'après confirmation manuelle via le bouton.
         cleanup_id = f"{message.chat.id}|{int(time.time())}"
@@ -3015,19 +3228,40 @@ def process_upload_in_chunks(file_content: str) -> Dict[str, Any]:
                     if url not in urls_a_tester:
                         urls_a_tester.append(url)
 
-            if (
-                links_tested_so_far + len(urls_a_tester)
-                > MAX_LINKS_CHECK_UPLOAD
-            ):
+            budget_restant = (
+                MAX_LINKS_CHECK_UPLOAD - links_tested_so_far
+            )
+
+            if budget_restant <= 0:
 
                 verification_desactivee = True
 
             elif urls_a_tester:
 
-                links_tested_so_far += len(urls_a_tester)
+                # Teste jusqu'au budget restant, pas tout ou rien :
+                # même si ce paquet dépasse le plafond, la partie
+                # qui rentre encore dedans est testée avant de
+                # désactiver la suite. Avant cette correction, un
+                # paquet plus grand que le plafond (ex: 300 liens
+                # pour un plafond de 150) désactivait la
+                # vérification pour TOUT le paquet sans rien tester
+                # du tout.
+                urls_testees_ce_paquet = urls_a_tester[
+                    :budget_restant
+                ]
+                urls_non_testees = set(
+                    urls_a_tester[budget_restant:]
+                )
+
+                links_tested_so_far += len(urls_testees_ce_paquet)
+
+                if urls_non_testees:
+                    # Le budget est désormais épuisé : les paquets
+                    # suivants ne testeront plus rien.
+                    verification_desactivee = True
 
                 statut = check_urls_status(
-                    urls_a_tester,
+                    urls_testees_ce_paquet,
                     max_workers=BULK_CHECK_MAX_WORKERS,
                     batch_size=BULK_CHECK_BATCH_SIZE,
                     batch_pause_seconds=(
@@ -3039,7 +3273,12 @@ def process_upload_in_chunks(file_content: str) -> Dict[str, Any]:
 
                     url = url_par_bloc.get(block)
 
-                    if url and statut.get(url) is False:
+                    if url in urls_non_testees:
+                        # Hors budget pour ce paquet : conservé
+                        # sans test, comme le reste après
+                        # désactivation.
+                        write_kept_block(block)
+                    elif url and statut.get(url) is False:
                         dead_count += 1
                     else:
                         write_kept_block(block)
@@ -3844,11 +4083,14 @@ def callback_handler(call):
                     "original_name", target_filename
                 )
 
-                delete_file_from_supabase(target_filename)
+                # Sauvegarde de sécurité AVANT toute modification —
+                # permet une restauration manuelle si besoin.
+                backup_file_before_cleanup(
+                    target_filename, original_name, current_content
+                )
 
-                save_file_to_supabase(
+                update_file_content_in_supabase(
                     filename=target_filename,
-                    original_name=original_name,
                     file_content=new_content,
                     links_count=new_link_count,
                     file_size=len(new_content.encode("utf-8"))
