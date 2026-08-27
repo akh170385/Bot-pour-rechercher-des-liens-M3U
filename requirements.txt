@@ -2,3 +2,4 @@ pyTelegramBotAPI==4.13.0
 Flask
 gunicorn
 supabase
+requests
