@@ -9,7 +9,7 @@ import threading
 import unicodedata
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, date
-from typing import List, Set, Dict, Optional, Any, Tuple
+from typing import List, Set, Dict, Optional, Any
 from urllib.parse import urlparse, parse_qs, unquote, urlencode
 
 import telebot
@@ -2027,31 +2027,95 @@ def build_pagination_markup(
     current_page: int,
     total_pages: int
 ):
-    """Construit le clavier inline pour la pagination cumulative."""
+    """Construit le clavier inline pour la pagination."""
 
     from telebot.types import (
         InlineKeyboardMarkup,
         InlineKeyboardButton
     )
 
-    if current_page >= total_pages:
-        return None
-
     markup = InlineKeyboardMarkup(
-        row_width=1
+        row_width=2
     )
 
-    markup.row(
-        InlineKeyboardButton(
-            "➡️ Suivant",
-            callback_data=(
-                f"page_{search_id}_"
-                f"{current_page + 1}"
+    buttons = []
+
+    if current_page > 1:
+
+        buttons.append(
+            InlineKeyboardButton(
+                "⬅️ Précédent",
+                callback_data=(
+                    f"page_{search_id}_"
+                    f"{current_page - 1}"
+                )
             )
         )
-    )
+
+    else:
+
+        buttons.append(
+            InlineKeyboardButton(
+                "⬅️ Précédent",
+                callback_data="disabled"
+            )
+        )
+
+    if current_page < total_pages:
+
+        buttons.append(
+            InlineKeyboardButton(
+                "➡️ Suivant",
+                callback_data=(
+                    f"page_{search_id}_"
+                    f"{current_page + 1}"
+                )
+            )
+        )
+
+    else:
+
+        buttons.append(
+            InlineKeyboardButton(
+                "➡️ Suivant",
+                callback_data="disabled"
+            )
+        )
+
+    markup.row(*buttons)
+
+    if total_pages > 2:
+
+        nav_buttons = []
+
+        if current_page > 2:
+
+            nav_buttons.append(
+                InlineKeyboardButton(
+                    "⏮️ Début",
+                    callback_data=(
+                        f"page_{search_id}_1"
+                    )
+                )
+            )
+
+        if current_page < total_pages - 1:
+
+            nav_buttons.append(
+                InlineKeyboardButton(
+                    "⏭️ Fin",
+                    callback_data=(
+                        f"page_{search_id}_"
+                        f"{total_pages}"
+                    )
+                )
+            )
+
+        if nav_buttons:
+            markup.row(*nav_buttons)
 
     return markup
+
 
 # ============================================================
 # OUTILS
@@ -4060,10 +4124,6 @@ def callback_handler(call):
             #
             # Exemple:
             # page_123456789|1723456789_2
-            #
-            # La pagination est cumulative : le message cliqué reste
-            # dans la conversation et la page suivante est envoyée
-            # comme un nouveau message en dessous.
 
             parts = call.data.split("_", 2)
 
@@ -4124,71 +4184,139 @@ def callback_handler(call):
 
                         return
 
-                    # Seule la page immédiatement suivante est valide.
-                    # Cela évite qu'un ancien callback encore présent
-                    # provoque une duplication de page.
-                    current_page = state.get("page", 1)
+                    if "extra_message_ids" in state:
 
-                    if target_page != current_page + 1:
-
-                        bot.answer_callback_query(
-                            call.id,
-                            "⚠️ Cette page a déjà été affichée."
-                        )
-
-                        return
-
-                    # Retire uniquement le clavier du message cliqué.
-                    # Le contenu de la page précédente reste intact.
-                    try:
-
-                        bot.edit_message_reply_markup(
+                        cleanup_extra_messages(
                             chat_id,
-                            call.message.message_id,
-                            reply_markup=None
+                            state[
+                                "extra_message_ids"
+                            ]
                         )
 
-                    except Exception as e:
+                        state[
+                            "extra_message_ids"
+                        ] = []
 
-                        logger.warning(
-                            "⚠️ Impossible de retirer "
-                            f"le bouton de pagination : {e}"
+                    state["page"] = target_page
+
+                    page_results = get_page_results(
+                        results,
+                        target_page
+                    )
+
+                    formatted_text = (
+                        format_page_results(
+                            page_results,
+                            len(results),
+                            target_page,
+                            total_pages
                         )
+                    )
 
-                    result = send_paginated_message(
+                    markup = build_pagination_markup(
                         chat_id,
                         search_id,
-                        results,
                         target_page,
                         total_pages
                     )
 
-                    state["page"] = target_page
+                    if len(formatted_text) > 4000:
 
-                    # Les messages de toutes les pages déjà envoyées
-                    # sont conservés afin qu'aucune page précédente ne
-                    # soit supprimée lors de l'affichage de la suivante.
-                    page_message_ids = []
-
-                    if result.get("main_message_id") is not None:
-
-                        page_message_ids.append(
-                            result["main_message_id"]
+                        chunks = split_text_into_chunks(
+                            formatted_text,
+                            4000
                         )
 
-                    page_message_ids.extend(
-                        result.get(
-                            "extra_message_ids",
-                            []
-                        )
-                    )
+                        try:
 
-                    state.setdefault(
-                        "extra_message_ids",
-                        []
-                    ).extend(page_message_ids)
+                            bot.edit_message_text(
+                                chunks[0],
+                                call.message.chat.id,
+                                call.message.message_id,
+                                reply_markup=markup
+                            )
 
-                    state["timestamp"] = time.time()
+                        except Exception as e:
+
+                            logger.warning(
+                                "⚠️ Erreur lors de "
+                                f"l'édition du message : {e}"
+                            )
+
+                            new_msg = bot.send_message(
+                                call.message.chat.id,
+                                chunks[0],
+                                reply_markup=markup
+                            )
+
+                            state[
+                                "main_message_id"
+                            ] = new_msg.message_id
+
+                            try:
+
+                                bot.delete_message(
+                                    call.message.chat.id,
+                                    call.message.message_id
+                                )
+
+                            except Exception:
+                                pass
+
+                        extra_ids = []
+
+                        for chunk in chunks[1:]:
+
+                            extra_msg = bot.send_message(
+                                call.message.chat.id,
+                                chunk
+                            )
+
+                            extra_ids.append(
+                                extra_msg.message_id
+                            )
+
+                        state[
+                            "extra_message_ids"
+                        ] = extra_ids
+
+                    else:
+
+                        try:
+
+                            bot.edit_message_text(
+                                formatted_text,
+                                call.message.chat.id,
+                                call.message.message_id,
+                                reply_markup=markup
+                            )
+
+                        except Exception as e:
+
+                            logger.warning(
+                                "⚠️ Erreur lors de "
+                                f"l'édition du message : {e}"
+                            )
+
+                            new_msg = bot.send_message(
+                                call.message.chat.id,
+                                formatted_text,
+                                reply_markup=markup
+                            )
+
+                            state[
+                                "main_message_id"
+                            ] = new_msg.message_id
+
+                            try:
+
+                                bot.delete_message(
+                                    call.message.chat.id,
+                                    call.message.message_id
+                                )
+
+                            except Exception:
+                                pass
 
                     bot.answer_callback_query(
                         call.id
@@ -4207,7 +4335,6 @@ def callback_handler(call):
                     call.id,
                     "❌ Format de pagination invalide"
                 )
-
 
         elif (
             call.data.startswith("verifyexp_")
