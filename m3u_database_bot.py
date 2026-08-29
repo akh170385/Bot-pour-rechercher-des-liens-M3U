@@ -6,9 +6,10 @@ import time
 import hashlib
 import logging
 import threading
+import unicodedata
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, date
-from typing import List, Set, Dict, Optional, Any
+from typing import List, Set, Dict, Optional, Any, Tuple
 from urllib.parse import urlparse, parse_qs, unquote, urlencode
 
 import telebot
@@ -1022,7 +1023,211 @@ def build_player_api_url(get_php_url: str) -> Optional[str]:
         "password": password
     })
 
-    return f"http://{host}{port}/player_api.php?{params}"
+    scheme = parsed.scheme or "http"
+    return f"{scheme}://{host}{port}/player_api.php?{params}"
+
+
+def check_account_status_details(
+    player_api_url: str
+) -> Optional[Dict[str, Any]]:
+    """
+    Vérification stricte utilisée par /m3u.
+
+    Interroge player_api.php et retourne les informations réellement
+    fournies par le panel :
+      - active : compte accepté comme actif ou non ;
+      - expiration : date d'expiration réelle si le panel la fournit ;
+      - status : statut textuel du panel.
+
+    Retourne None si le panel ne fournit pas une réponse Xtream
+    interprétable. Dans ce cas /m3u n'affiche PAS le compte : on ne
+    prétend pas qu'il est valide sans avoir pu le vérifier.
+    """
+    if not REQUESTS_AVAILABLE:
+        return None
+
+    try:
+        response = requests.get(
+            player_api_url,
+            timeout=LINK_CHECK_TIMEOUT_SECONDS
+        )
+
+        if response.status_code >= 400:
+            response.close()
+            return None
+
+        data = response.json()
+        response.close()
+
+        if not isinstance(data, dict):
+            return None
+
+        user_info = data.get("user_info")
+
+        if not isinstance(user_info, dict):
+            return None
+
+        if "status" not in user_info and "auth" not in user_info:
+            return None
+
+        auth_value = str(user_info.get("auth", "")).strip().lower()
+        status_value = str(
+            user_info.get("status", "")
+        ).strip().lower()
+
+        active = (
+            auth_value in {"1", "true"}
+            and status_value == "active"
+        )
+
+        expiration = None
+        exp_raw = user_info.get("exp_date")
+
+        if exp_raw not in (None, "", 0, "0"):
+            try:
+                timestamp = int(float(str(exp_raw).strip()))
+                if timestamp > 0:
+                    expiration = datetime.fromtimestamp(
+                        timestamp
+                    ).date()
+            except (ValueError, TypeError, OverflowError, OSError):
+                expiration = None
+
+        # Si le panel fournit une date réelle et qu'elle est dépassée,
+        # elle prime sur le simple champ status.
+        if expiration is not None and expiration < date.today():
+            active = False
+
+        return {
+            "active": active,
+            "expiration": expiration,
+            "status": status_value or "inconnu"
+        }
+
+    except Exception as e:
+        logger.debug(
+            f"🔍 Vérification player_api impossible : {e}"
+        )
+        return None
+
+
+def verify_block_live_for_search(
+    block: str
+) -> Dict[str, Any]:
+    """
+    Vérifie un bloc individuellement pour /m3u.
+
+    Contrairement aux anciennes vérifications facultatives, cette
+    fonction exige une réponse interprétable de player_api.php.
+    Aucun résultat non vérifié n'est envoyé à l'utilisateur.
+    """
+    result = {
+        "block": block,
+        "active": False,
+        "verified": False,
+        "expiration": None,
+        "status": None,
+        "reason": "non_vérifiable"
+    }
+
+    if not REQUESTS_AVAILABLE:
+        result["reason"] = "requests_indisponible"
+        return result
+
+    url = extract_first_url(block)
+
+    if not url:
+        result["reason"] = "lien_m3u_absent"
+        return result
+
+    player_api_url = build_player_api_url(url)
+
+    if not player_api_url:
+        result["reason"] = "identifiants_absents"
+        return result
+
+    details = check_account_status_details(player_api_url)
+
+    if details is None:
+        result["reason"] = "player_api_non_interprétable"
+        return result
+
+    result["verified"] = True
+    result["active"] = bool(details["active"])
+    result["expiration"] = details["expiration"]
+    result["status"] = details["status"]
+
+    if result["active"]:
+        result["reason"] = "actif"
+    else:
+        result["reason"] = "inactif_ou_expiré"
+
+    if result["active"] and result["expiration"] is not None:
+        result["block"] = replace_expiration_date_in_block(
+            block,
+            result["expiration"]
+        )
+
+    return result
+
+
+def verify_blocks_live_for_search(
+    blocks: List[str]
+) -> Tuple[List[str], Dict[str, int]]:
+    """
+    Vérifie tous les résultats d'une recherche /m3u en parallèle.
+
+    Seuls les comptes confirmés actifs par player_api.php sont
+    conservés. Les autres sont comptabilisés mais jamais affichés.
+    """
+    if not blocks:
+        return [], {
+            "tested": 0,
+            "active": 0,
+            "inactive": 0,
+            "unverified": 0
+        }
+
+    verified_blocks: List[str] = []
+    inactive_count = 0
+    unverified_count = 0
+
+    with ThreadPoolExecutor(
+        max_workers=min(LINK_CHECK_MAX_WORKERS, len(blocks))
+    ) as executor:
+
+        futures = [
+            executor.submit(
+                verify_block_live_for_search,
+                block
+            )
+            for block in blocks
+        ]
+
+        for future in futures:
+            try:
+                result = future.result()
+            except Exception as e:
+                logger.warning(
+                    f"⚠️ Erreur vérification /m3u : {e}"
+                )
+                unverified_count += 1
+                continue
+
+            if result["verified"] and result["active"]:
+                verified_blocks.append(result["block"])
+            elif result["verified"]:
+                inactive_count += 1
+            else:
+                unverified_count += 1
+
+    return verified_blocks, {
+        "tested": len(blocks),
+        "active": len(verified_blocks),
+        "inactive": inactive_count,
+        "unverified": unverified_count
+    }
+
 
 
 def check_account_status_alive(player_api_url: str) -> Optional[bool]:
@@ -1822,108 +2027,31 @@ def build_pagination_markup(
     current_page: int,
     total_pages: int
 ):
-    """Construit le clavier inline pour la pagination."""
+    """Construit le clavier inline pour la pagination cumulative."""
 
     from telebot.types import (
         InlineKeyboardMarkup,
         InlineKeyboardButton
     )
 
+    if current_page >= total_pages:
+        return None
+
     markup = InlineKeyboardMarkup(
-        row_width=2
+        row_width=1
     )
 
-    buttons = []
-
-    if current_page > 1:
-
-        buttons.append(
-            InlineKeyboardButton(
-                "⬅️ Précédent",
-                callback_data=(
-                    f"page_{search_id}_"
-                    f"{current_page - 1}"
-                )
-            )
-        )
-
-    else:
-
-        buttons.append(
-            InlineKeyboardButton(
-                "⬅️ Précédent",
-                callback_data="disabled"
-            )
-        )
-
-    if current_page < total_pages:
-
-        buttons.append(
-            InlineKeyboardButton(
-                "➡️ Suivant",
-                callback_data=(
-                    f"page_{search_id}_"
-                    f"{current_page + 1}"
-                )
-            )
-        )
-
-    else:
-
-        buttons.append(
-            InlineKeyboardButton(
-                "➡️ Suivant",
-                callback_data="disabled"
-            )
-        )
-
-    markup.row(*buttons)
-
-    if total_pages > 2:
-
-        nav_buttons = []
-
-        if current_page > 2:
-
-            nav_buttons.append(
-                InlineKeyboardButton(
-                    "⏮️ Début",
-                    callback_data=(
-                        f"page_{search_id}_1"
-                    )
-                )
-            )
-
-        if current_page < total_pages - 1:
-
-            nav_buttons.append(
-                InlineKeyboardButton(
-                    "⏭️ Fin",
-                    callback_data=(
-                        f"page_{search_id}_"
-                        f"{total_pages}"
-                    )
-                )
-            )
-
-        if nav_buttons:
-            markup.row(*nav_buttons)
-
-    # Cette vérification porte uniquement sur les dates Exp déjà
-    # présentes dans les blocs. Elle ne dépend donc pas du module
-    # requests et reste disponible même si les vérifications réseau
-    # sont désactivées.
     markup.row(
         InlineKeyboardButton(
-            "🗓️ Vérifier les dates de cette page",
+            "➡️ Suivant",
             callback_data=(
-                f"verifyexp_{search_id}_{current_page}"
+                f"page_{search_id}_"
+                f"{current_page + 1}"
             )
         )
     )
 
     return markup
-
 
 # ============================================================
 # OUTILS
@@ -2374,22 +2502,68 @@ def m3u_handler(message):
             f"🔎 Recherche lancée : {server_url}"
         )
 
+        try:
+            bot.edit_message_text(
+                f"🔍 Recherche pour :\n{server_url}\n\n"
+                "🧐 Veuillez patienter...",
+                search_msg.chat.id,
+                search_msg.message_id
+            )
+        except Exception as e:
+            logger.debug(
+                f"🔍 Impossible d'afficher le message d'attente : {e}"
+            )
+
         blocks = search_links_in_supabase(
             server_url
         )
 
-        # Filtrage obligatoire par date d'expiration AVANT la pagination
-        # et avant l'affichage. Un compte dont Exp est déjà passée ne
-        # doit donc jamais apparaître dans les résultats /m3u.
-        blocks_before_expiration_filter = len(blocks)
-        blocks, expired_blocks = filter_expired_blocks(blocks)
+        # IMPORTANT : ne jamais éliminer un résultat /m3u uniquement
+        # à cause de la date Exp enregistrée dans le fichier.
+        # Cette date peut être ancienne ou erronée (par exemple un
+        # compte affiché Exp 16/08 alors que le panel retourne réellement
+        # 16/09). Tous les candidats sont donc envoyés à player_api.php,
+        # qui fournit la décision et la date réelles.
+        blocks_before_live_verification = len(blocks)
 
         logger.info(
-            f"🔎 Résultats trouvés : "
-            f"{blocks_before_expiration_filter} | "
-            f"🗓️ expirés écartés : {len(expired_blocks)} | "
-            f"✅ résultats conservés : {len(blocks)}"
+            f"🔎 Résultats trouvés dans Supabase : "
+            f"{blocks_before_live_verification} | "
+            "🔍 vérification réelle obligatoire via player_api.php"
         )
+
+        if blocks:
+            try:
+                bot.edit_message_text(
+                    f"🔍 Recherche pour :\n{server_url}\n\n"
+                    "🧐 Veuillez patienter...\n"
+                    f"🔎 Vérification réelle de {len(blocks)} compte(s)...",
+                    search_msg.chat.id,
+                    search_msg.message_id
+                )
+            except Exception as e:
+                logger.debug(
+                    f"🔍 Impossible de mettre à jour le message d'attente : {e}"
+                )
+
+            blocks, live_stats = verify_blocks_live_for_search(
+                blocks
+            )
+
+            logger.info(
+                f"🔍 Vérification réelle /m3u terminée : "
+                f"testés={live_stats['tested']} | "
+                f"actifs={live_stats['active']} | "
+                f"inactifs/expirés={live_stats['inactive']} | "
+                f"non_vérifiables={live_stats['unverified']}"
+            )
+        else:
+            live_stats = {
+                "tested": 0,
+                "active": 0,
+                "inactive": 0,
+                "unverified": 0
+            }
 
         chat_id = message.chat.id
 
@@ -2465,18 +2639,27 @@ def m3u_handler(message):
 
         else:
 
-            if expired_blocks:
-                result_text = (
-                    "❌ Aucun résultat actif trouvé pour :\n"
-                    f"{server_url}\n\n"
-                    f"🗓️ {len(expired_blocks)} résultat(s) expiré(s) "
-                    "ont été écarté(s) automatiquement."
+            details = []
+
+            if live_stats["inactive"]:
+                details.append(
+                    f"❌ {live_stats['inactive']} compte(s) "
+                    "inactif(s) ou expiré(s) après vérification réelle"
                 )
-            else:
-                result_text = (
-                    "❌ Aucun résultat trouvé pour :\n"
-                    f"{server_url}"
+
+            if live_stats["unverified"]:
+                details.append(
+                    f"⚠️ {live_stats['unverified']} compte(s) "
+                    "non vérifiable(s) — non affiché(s)"
                 )
+
+            result_text = (
+                "❌ Aucun résultat actif vérifié trouvé pour :\n"
+                f"{server_url}"
+            )
+
+            if details:
+                result_text += "\n\n" + "\n".join(details)
 
             try:
 
@@ -2772,13 +2955,17 @@ def set_bot_state(key: str, value: str) -> None:
 
 def extract_expiration_date(block: str) -> Optional[date]:
     """
-    Cherche un champ "Exp : JJ/MM/AAAA" (ou avec des tirets) dans
-    le bloc et retourne la date correspondante si trouvée.
-    Aucune requête réseau — pure lecture de texte déjà en mémoire.
+    Cherche un champ "Exp : JJ/MM/AAAA" dans le bloc.
+
+    Le texte affiché par le bot peut utiliser des caractères Unicode
+    stylisés (par exemple "𝙀𝙭𝙥"). NFKC les ramène à "Exp" avant
+    l'analyse afin que le filtre fonctionne aussi avec ces blocs.
     """
+    normalized_block = unicodedata.normalize("NFKC", block)
+
     match = re.search(
-        r"exp\s*:?\s*(\d{1,2})[/\-](\d{1,2})[/\-](\d{4})",
-        block,
+        r"\bexp\s*:?\s*(\d{1,2})[/\-](\d{1,2})[/\-](\d{4})",
+        normalized_block,
         re.IGNORECASE
     )
 
@@ -2791,6 +2978,33 @@ def extract_expiration_date(block: str) -> Optional[date]:
         return date(int(year_str), int(month_str), int(day_str))
     except ValueError:
         return None
+
+
+def replace_expiration_date_in_block(
+    block: str,
+    actual_expiration: Optional[date]
+) -> str:
+    """
+    Remplace uniquement la ligne Exp d'un bloc par la date réellement
+    retournée par le panel, sans toucher aux autres informations.
+    Si aucune date réelle n'est disponible, le bloc est laissé intact.
+    """
+    if actual_expiration is None:
+        return block
+
+    normalized = unicodedata.normalize("NFKC", block)
+    lines = normalized.splitlines()
+
+    replacement = (
+        f"• 𝙀𝙭𝙥 : {actual_expiration.strftime('%d/%m/%Y')}"
+    )
+
+    for index, line in enumerate(lines):
+        if re.search(r"^\s*[•-]?\s*exp\s*:", line, re.IGNORECASE):
+            lines[index] = replacement
+            return "\n".join(lines)
+
+    return block
 
 
 def is_expired_by_date(block: str) -> bool:
@@ -3846,6 +4060,10 @@ def callback_handler(call):
             #
             # Exemple:
             # page_123456789|1723456789_2
+            #
+            # La pagination est cumulative : le message cliqué reste
+            # dans la conversation et la page suivante est envoyée
+            # comme un nouveau message en dessous.
 
             parts = call.data.split("_", 2)
 
@@ -3906,139 +4124,71 @@ def callback_handler(call):
 
                         return
 
-                    if "extra_message_ids" in state:
+                    # Seule la page immédiatement suivante est valide.
+                    # Cela évite qu'un ancien callback encore présent
+                    # provoque une duplication de page.
+                    current_page = state.get("page", 1)
 
-                        cleanup_extra_messages(
+                    if target_page != current_page + 1:
+
+                        bot.answer_callback_query(
+                            call.id,
+                            "⚠️ Cette page a déjà été affichée."
+                        )
+
+                        return
+
+                    # Retire uniquement le clavier du message cliqué.
+                    # Le contenu de la page précédente reste intact.
+                    try:
+
+                        bot.edit_message_reply_markup(
                             chat_id,
-                            state[
-                                "extra_message_ids"
-                            ]
+                            call.message.message_id,
+                            reply_markup=None
                         )
 
-                        state[
-                            "extra_message_ids"
-                        ] = []
+                    except Exception as e:
 
-                    state["page"] = target_page
-
-                    page_results = get_page_results(
-                        results,
-                        target_page
-                    )
-
-                    formatted_text = (
-                        format_page_results(
-                            page_results,
-                            len(results),
-                            target_page,
-                            total_pages
+                        logger.warning(
+                            "⚠️ Impossible de retirer "
+                            f"le bouton de pagination : {e}"
                         )
-                    )
 
-                    markup = build_pagination_markup(
+                    result = send_paginated_message(
                         chat_id,
                         search_id,
+                        results,
                         target_page,
                         total_pages
                     )
 
-                    if len(formatted_text) > 4000:
+                    state["page"] = target_page
 
-                        chunks = split_text_into_chunks(
-                            formatted_text,
-                            4000
+                    # Les messages de toutes les pages déjà envoyées
+                    # sont conservés afin qu'aucune page précédente ne
+                    # soit supprimée lors de l'affichage de la suivante.
+                    page_message_ids = []
+
+                    if result.get("main_message_id") is not None:
+
+                        page_message_ids.append(
+                            result["main_message_id"]
                         )
 
-                        try:
+                    page_message_ids.extend(
+                        result.get(
+                            "extra_message_ids",
+                            []
+                        )
+                    )
 
-                            bot.edit_message_text(
-                                chunks[0],
-                                call.message.chat.id,
-                                call.message.message_id,
-                                reply_markup=markup
-                            )
+                    state.setdefault(
+                        "extra_message_ids",
+                        []
+                    ).extend(page_message_ids)
 
-                        except Exception as e:
-
-                            logger.warning(
-                                "⚠️ Erreur lors de "
-                                f"l'édition du message : {e}"
-                            )
-
-                            new_msg = bot.send_message(
-                                call.message.chat.id,
-                                chunks[0],
-                                reply_markup=markup
-                            )
-
-                            state[
-                                "main_message_id"
-                            ] = new_msg.message_id
-
-                            try:
-
-                                bot.delete_message(
-                                    call.message.chat.id,
-                                    call.message.message_id
-                                )
-
-                            except Exception:
-                                pass
-
-                        extra_ids = []
-
-                        for chunk in chunks[1:]:
-
-                            extra_msg = bot.send_message(
-                                call.message.chat.id,
-                                chunk
-                            )
-
-                            extra_ids.append(
-                                extra_msg.message_id
-                            )
-
-                        state[
-                            "extra_message_ids"
-                        ] = extra_ids
-
-                    else:
-
-                        try:
-
-                            bot.edit_message_text(
-                                formatted_text,
-                                call.message.chat.id,
-                                call.message.message_id,
-                                reply_markup=markup
-                            )
-
-                        except Exception as e:
-
-                            logger.warning(
-                                "⚠️ Erreur lors de "
-                                f"l'édition du message : {e}"
-                            )
-
-                            new_msg = bot.send_message(
-                                call.message.chat.id,
-                                formatted_text,
-                                reply_markup=markup
-                            )
-
-                            state[
-                                "main_message_id"
-                            ] = new_msg.message_id
-
-                            try:
-
-                                bot.delete_message(
-                                    call.message.chat.id,
-                                    call.message.message_id
-                                )
-
-                            except Exception:
-                                pass
+                    state["timestamp"] = time.time()
 
                     bot.answer_callback_query(
                         call.id
@@ -4057,6 +4207,7 @@ def callback_handler(call):
                     call.id,
                     "❌ Format de pagination invalide"
                 )
+
 
         elif (
             call.data.startswith("verifyexp_")
