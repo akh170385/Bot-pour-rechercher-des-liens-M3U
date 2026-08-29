@@ -1909,16 +1909,18 @@ def build_pagination_markup(
         if nav_buttons:
             markup.row(*nav_buttons)
 
-    if REQUESTS_AVAILABLE:
-
-        markup.row(
-            InlineKeyboardButton(
-                "🔎 Vérifier les liens de cette page",
-                callback_data=(
-                    f"verify_{search_id}_{current_page}"
-                )
+    # Cette vérification porte uniquement sur les dates Exp déjà
+    # présentes dans les blocs. Elle ne dépend donc pas du module
+    # requests et reste disponible même si les vérifications réseau
+    # sont désactivées.
+    markup.row(
+        InlineKeyboardButton(
+            "🗓️ Vérifier les dates de cette page",
+            callback_data=(
+                f"verifyexp_{search_id}_{current_page}"
             )
         )
+    )
 
     return markup
 
@@ -2376,8 +2378,17 @@ def m3u_handler(message):
             server_url
         )
 
+        # Filtrage obligatoire par date d'expiration AVANT la pagination
+        # et avant l'affichage. Un compte dont Exp est déjà passée ne
+        # doit donc jamais apparaître dans les résultats /m3u.
+        blocks_before_expiration_filter = len(blocks)
+        blocks, expired_blocks = filter_expired_blocks(blocks)
+
         logger.info(
-            f"🔎 Résultats trouvés : {len(blocks)}"
+            f"🔎 Résultats trouvés : "
+            f"{blocks_before_expiration_filter} | "
+            f"🗓️ expirés écartés : {len(expired_blocks)} | "
+            f"✅ résultats conservés : {len(blocks)}"
         )
 
         chat_id = message.chat.id
@@ -2454,10 +2465,18 @@ def m3u_handler(message):
 
         else:
 
-            result_text = (
-                "❌ Aucun résultat trouvé pour :\n"
-                f"{server_url}"
-            )
+            if expired_blocks:
+                result_text = (
+                    "❌ Aucun résultat actif trouvé pour :\n"
+                    f"{server_url}\n\n"
+                    f"🗓️ {len(expired_blocks)} résultat(s) expiré(s) "
+                    "ont été écarté(s) automatiquement."
+                )
+            else:
+                result_text = (
+                    "❌ Aucun résultat trouvé pour :\n"
+                    f"{server_url}"
+                )
 
             try:
 
@@ -2782,6 +2801,33 @@ def is_expired_by_date(block: str) -> bool:
         return False
 
     return exp_date < date.today()
+
+
+def filter_expired_blocks(
+    blocks: List[str]
+) -> Tuple[List[str], List[str]]:
+    """
+    Sépare les blocs actifs des blocs dont la date d'expiration est
+    déjà passée.
+
+    Règle volontairement prudente :
+    - une date Exp valide et antérieure à aujourd'hui => expiré ;
+    - une date Exp égale à aujourd'hui => encore valable aujourd'hui ;
+    - aucune date Exp lisible => conservé, car l'absence de date ne
+      permet pas d'affirmer que le compte est expiré.
+
+    Retourne (blocs_valides, blocs_expires).
+    """
+    valid_blocks: List[str] = []
+    expired_blocks: List[str] = []
+
+    for block in blocks:
+        if is_expired_by_date(block):
+            expired_blocks.append(block)
+        else:
+            valid_blocks.append(block)
+
+    return valid_blocks, expired_blocks
 
 
 def get_all_blocks_for_scan() -> List[Dict]:
@@ -4012,10 +4058,16 @@ def callback_handler(call):
                     "❌ Format de pagination invalide"
                 )
 
-        elif call.data.startswith("verify_"):
+        elif (
+            call.data.startswith("verifyexp_")
+            or call.data.startswith("verify_")
+        ):
 
-            # Format attendu : verify_{chat_id}|{timestamp}_{page}
-            # Même découpage que pour "page_" (le search_id contient "|").
+            # "verifyexp_" est le nouveau format. Le format "verify_"
+            # est accepté aussi pour que les anciens boutons déjà envoyés
+            # dans Telegram restent fonctionnels après le déploiement.
+            # Dans les deux cas, cette action vérifie uniquement les
+            # dates Exp et retire de la recherche les blocs déjà expirés.
             parts = call.data.split("_", 2)
 
             if len(parts) == 3:
@@ -4026,6 +4078,8 @@ def callback_handler(call):
                 try:
                     target_page = int(page_str)
 
+                    cleanup_expired_states()
+
                     if search_id not in pagination_state:
                         bot.answer_callback_query(
                             call.id,
@@ -4033,44 +4087,65 @@ def callback_handler(call):
                         )
                         return
 
-                    if not REQUESTS_AVAILABLE:
+                    state = pagination_state[search_id]
+
+                    if state.get("chat_id") != call.message.chat.id:
                         bot.answer_callback_query(
                             call.id,
-                            "❌ Vérification indisponible sur ce serveur."
+                            "❌ Cette recherche n'est pas dans ce chat."
                         )
                         return
 
-                    bot.answer_callback_query(
-                        call.id,
-                        "🔎 Vérification en cours..."
-                    )
-
-                    state = pagination_state[search_id]
                     all_results = state.get("results", [])
 
+                    # Relecture locale uniquement : aucune requête réseau.
+                    # Cela permet de rattraper un résultat qui serait devenu
+                    # expiré entre la recherche initiale et le clic.
+                    valid_results, expired_blocks = filter_expired_blocks(
+                        all_results
+                    )
+
+                    state["results"] = valid_results
+                    state["total_pages"] = get_total_pages(
+                        len(valid_results)
+                    )
+
+                    total_pages = state["total_pages"]
+
+                    if target_page < 1:
+                        target_page = 1
+
+                    if target_page > total_pages:
+                        target_page = total_pages
+
+                    state["page"] = target_page
+                    state["timestamp"] = time.time()
+
                     page_results = get_page_results(
-                        all_results,
+                        valid_results,
                         target_page
                     )
 
-                    # Le test des liens (requêtes HTTP) se fait en
-                    # arrière-plan : le webhook Telegram a déjà reçu
-                    # sa réponse "OK" bien avant, donc pas de risque
-                    # de timeout côté Telegram.
-                    status = check_links_status(page_results)
+                    if expired_blocks:
+                        notice = (
+                            f"🗓️ Vérification terminée : "
+                            f"{len(expired_blocks)} résultat(s) expiré(s) "
+                            f"retiré(s) de cette recherche.\n\n"
+                        )
+                    else:
+                        notice = (
+                            "🗓️ Vérification terminée : aucune date "
+                            "d'expiration dépassée sur cette recherche.\n\n"
+                        )
 
-                    annotated_results = annotate_blocks_with_status(
-                        page_results,
-                        status
-                    )
-
-                    total_pages = state.get("total_pages", 1)
-
-                    formatted_text = format_page_results(
-                        annotated_results,
-                        len(all_results),
-                        target_page,
-                        total_pages
+                    formatted_text = (
+                        notice
+                        + format_page_results(
+                            page_results,
+                            len(valid_results),
+                            target_page,
+                            total_pages
+                        )
                     )
 
                     markup = build_pagination_markup(
@@ -4078,6 +4153,15 @@ def callback_handler(call):
                         search_id,
                         target_page,
                         total_pages
+                    )
+
+                    bot.answer_callback_query(
+                        call.id,
+                        (
+                            f"🗓️ {len(expired_blocks)} expiré(s) retiré(s)."
+                            if expired_blocks
+                            else "🗓️ Aucune expiration détectée."
+                        )
                     )
 
                     try:
@@ -4090,14 +4174,14 @@ def callback_handler(call):
                     except Exception as e:
                         logger.warning(
                             "⚠️ Erreur lors de l'affichage "
-                            f"des résultats vérifiés : {e}"
+                            f"des résultats après vérification des dates : {e}"
                         )
 
                 except ValueError:
 
                     bot.answer_callback_query(
                         call.id,
-                        "❌ Erreur de vérification"
+                        "❌ Erreur de vérification des dates"
                     )
 
             else:
