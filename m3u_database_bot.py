@@ -9,7 +9,7 @@ import threading
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, date
 from typing import List, Set, Dict, Optional, Any
-from urllib.parse import urlparse, parse_qs, unquote
+from urllib.parse import urlparse, parse_qs, unquote, urlencode
 
 import telebot
 from flask import Flask, request
@@ -979,14 +979,124 @@ def extract_first_url(block: str) -> Optional[str]:
     return match.group(0) if match else None
 
 
+def build_player_api_url(get_php_url: str) -> Optional[str]:
+    """
+    Construit l'URL player_api.php (API standard des panels Xtream)
+    à partir de l'URL get.php d'un compte — même host, même port,
+    mêmes identifiants, juste un endpoint différent.
+
+    Pourquoi c'est important : get.php se comporte comme si on
+    regardait vraiment la chaîne — sur un compte limité à une seule
+    connexion simultanée (MaxConn: 1), si ce créneau est déjà
+    utilisé ailleurs au moment du test, le serveur rejette NOTRE
+    requête et le compte semble "mort" à tort, alors qu'il est
+    parfaitement valide. player_api.php renvoie le statut réel du
+    compte sans jamais consommer sa connexion active.
+
+    Retourne None si l'URL ne contient pas d'identifiants
+    reconnaissables (username/password) — l'appelant doit alors se
+    rabattre sur un autre moyen de vérification.
+    """
+    try:
+        parsed = urlparse(get_php_url)
+    except Exception:
+        return None
+
+    host = parsed.hostname
+
+    if not host:
+        return None
+
+    port = f":{parsed.port}" if parsed.port else ""
+
+    query = parse_qs(parsed.query)
+
+    username = query.get("username", [""])[0]
+    password = query.get("password", [""])[0]
+
+    if not username or not password:
+        return None
+
+    params = urlencode({
+        "username": username,
+        "password": password
+    })
+
+    return f"http://{host}{port}/player_api.php?{params}"
+
+
+def check_account_status_alive(player_api_url: str) -> Optional[bool]:
+    """
+    Teste un compte via player_api.php et interprète la réponse
+    JSON standard des panels Xtream :
+      user_info.auth == 1 ET user_info.status == "Active"
+      -> compte réellement actif.
+
+    Retourne None (ni True ni False) si la réponse ne peut pas être
+    interprétée avec confiance (JSON invalide, panel qui ne
+    supporte pas cet endpoint, champs absents) — pour que
+    l'appelant sache qu'il doit se rabattre sur un autre test
+    plutôt que de conclure "mort" à tort simplement parce que ce
+    panel précis répond différemment.
+    """
+    try:
+        response = requests.get(
+            player_api_url,
+            timeout=LINK_CHECK_TIMEOUT_SECONDS
+        )
+
+        if response.status_code >= 400:
+            response.close()
+            return False
+
+        data = response.json()
+        response.close()
+
+        user_info = data.get("user_info", {})
+
+        auth_ok = str(user_info.get("auth")) == "1"
+        status = str(user_info.get("status", "")).strip().lower()
+
+        if auth_ok and status == "active":
+            return True
+
+        if "status" in user_info:
+            # Réponse interprétable, mais compte pas actif
+            # (expired, banned, disabled...) — verdict fiable.
+            return False
+
+        return None
+
+    except Exception:
+        return None
+
+
 def check_link_alive(url: str) -> bool:
     """
-    Teste si un lien répond encore. Retourne False au moindre doute
-    (timeout, erreur de connexion, code d'erreur HTTP) — mieux vaut
-    un léger risque de faux "expiré" qu'un faux "actif".
+    Teste si un compte est réellement actif.
+
+    Priorité : player_api.php (statut réel du compte, ne consomme
+    jamais sa connexion active — voir build_player_api_url). Si ce
+    test échoue ou n'est pas interprétable (panel qui ne supporte
+    pas cet endpoint, réponse inattendue), repli sur un test direct
+    du lien fourni (comportement historique) — jamais de verdict
+    "mort" basé sur un seul type de test qui aurait échoué pour une
+    raison indépendante de l'état réel du compte.
     """
     if not REQUESTS_AVAILABLE:
         return True  # pas de vérification possible, on n'affirme rien de faux
+
+    player_api_url = build_player_api_url(url)
+
+    if player_api_url:
+
+        resultat = check_account_status_alive(player_api_url)
+
+        if resultat is not None:
+            return resultat
+
+        # player_api.php n'a pas donné de réponse interprétable :
+        # repli sur le test direct du lien d'origine ci-dessous.
 
     try:
         response = requests.get(
@@ -2128,13 +2238,25 @@ Recherche des liens M3U (accessible à tous)
             "📤 18. Tentative d'envoi de la réponse /start"
         )
 
-        bot.reply_to(
+        sent_message = bot.reply_to(
             message,
             welcome_text
         )
 
+        # Journalise la réponse réellement retournée par Telegram.
+        # Cela permet de confirmer que Telegram a bien créé le message
+        # et d'obtenir précisément son chat_id et son message_id.
         logger.info(
-            "✅ 19. Réponse /start envoyée avec succès."
+            "✅ 19. Réponse /start envoyée avec succès. "
+            f"chat_id={sent_message.chat.id}, "
+            f"message_id={sent_message.message_id}"
+        )
+
+        logger.info(
+            f"📨 Réponse Telegram réelle /start : "
+            f"chat_id={sent_message.chat.id}, "
+            f"message_id={sent_message.message_id}, "
+            f"text={sent_message.text!r}"
         )
 
     except Exception as e:
